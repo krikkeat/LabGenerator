@@ -14,6 +14,11 @@ locals {
       username      = "ec2-user"
       is_windows    = false
     }
+    "ubuntu-20.04" = {
+      ssm_parameter = "/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+      username      = "ubuntu"
+      is_windows    = false
+    }
     "ubuntu-22.04" = {
       ssm_parameter = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
       username      = "ubuntu"
@@ -24,6 +29,26 @@ locals {
       username      = "ubuntu"
       is_windows    = false
     }
+    "debian-11" = {
+      ssm_parameter = "/aws/service/debian/release/11/latest/amd64"
+      username      = "admin"
+      is_windows    = false
+    }
+    "debian-12" = {
+      ssm_parameter = "/aws/service/debian/release/12/latest/amd64"
+      username      = "admin"
+      is_windows    = false
+    }
+    "suse-15" = {
+      ssm_parameter = "/aws/service/suse/sles/15-sp6/x86_64/latest"
+      username      = "ec2-user"
+      is_windows    = false
+    }
+    "windows-2025" = {
+      ssm_parameter = "/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base"
+      username      = "Administrator"
+      is_windows    = true
+    }
     "windows-2022" = {
       ssm_parameter = "/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base"
       username      = "Administrator"
@@ -31,6 +56,11 @@ locals {
     }
     "windows-2019" = {
       ssm_parameter = "/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base"
+      username      = "Administrator"
+      is_windows    = true
+    }
+    "windows-2016" = {
+      ssm_parameter = "/aws/service/ami-windows-latest/Windows_Server-2016-English-Full-Base"
       username      = "Administrator"
       is_windows    = true
     }

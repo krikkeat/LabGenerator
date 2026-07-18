@@ -30,8 +30,12 @@ const HOURLY_USD = {
 
 const OS_LABELS = {
   'amazon-linux-2023': 'Amazon Linux 2023', 'amazon-linux-2': 'Amazon Linux 2',
-  'ubuntu-22.04': 'Ubuntu 22.04', 'ubuntu-24.04': 'Ubuntu 24.04',
-  'windows-2022': 'Windows Server 2022', 'windows-2019': 'Windows Server 2019',
+  'ubuntu-20.04': 'Ubuntu 20.04 LTS', 'ubuntu-22.04': 'Ubuntu 22.04 LTS',
+  'ubuntu-24.04': 'Ubuntu 24.04 LTS',
+  'debian-11': 'Debian 11 (Bullseye)', 'debian-12': 'Debian 12 (Bookworm)',
+  'suse-15': 'SUSE Linux Enterprise 15',
+  'windows-2025': 'Windows Server 2025', 'windows-2022': 'Windows Server 2022',
+  'windows-2019': 'Windows Server 2019', 'windows-2016': 'Windows Server 2016',
 };
 
 const STATUS_TH = {

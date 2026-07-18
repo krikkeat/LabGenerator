@@ -39,10 +39,16 @@ PRODUCTS_DIR = BASE_DIR / "products"
 SUPPORTED_OS = [
     "amazon-linux-2023",
     "amazon-linux-2",
+    "ubuntu-20.04",
     "ubuntu-22.04",
     "ubuntu-24.04",
+    "debian-11",
+    "debian-12",
+    "suse-15",
+    "windows-2025",
     "windows-2022",
     "windows-2019",
+    "windows-2016",
 ]
 
 

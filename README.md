@@ -85,7 +85,7 @@ python3 labctl.py serve                            # เปิด http://127.0.0
 | Field | ความหมาย |
 |---|---|
 | `lab_name` | ชื่อ lab (a-z, 0-9, `-`) ใช้เป็น prefix ของ resource ทั้งหมด |
-| `os` | `amazon-linux-2023`, `amazon-linux-2`, `ubuntu-22.04`, `ubuntu-24.04`, `windows-2022`, `windows-2019` |
+| `os` | `amazon-linux-2023`, `amazon-linux-2`, `ubuntu-20.04`, `ubuntu-22.04`, `ubuntu-24.04`, `debian-11`, `debian-12`, `suse-15`, `windows-2025`, `windows-2022`, `windows-2019`, `windows-2016` |
 | `users` | รายชื่อผู้เรียน — หนึ่งชื่อ = หนึ่ง VM |
 | `allowed_cidr` | จำกัด IP ที่เข้าถึง lab ได้ (แนะนำใส่ IP ของสถานที่อบรม เช่น `203.0.113.0/24`) |
 | `extra_open_ports` | พอร์ตเพิ่มเติมนอกจาก SSH/RDP เช่น `[80, 8080]` |
