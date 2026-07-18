@@ -1,0 +1,12 @@
+{
+  "lab_name": "cortex-training",
+  "product": "cortex-xdr",
+  "region": "ap-southeast-1",
+  "users": ["user01", "user02", "user03"],
+  "allowed_cidr": "0.0.0.0/0",
+  "expire_date": "2026-08-31",
+  "product_params": {
+    "CONSOLE_URL": "https://REPLACE-TENANT.xdr.sg.paloaltonetworks.com",
+    "AGENT_INSTALLER_URL": "https://REPLACE-WITH-YOUR-TENANT-INSTALLER-LINK/cortex-agent.msi"
+  }
+}

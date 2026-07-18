@@ -1,0 +1,25 @@
+{
+  "product_name": "Trend Vision One (TrendAI)",
+  "description": "Endpoint Security lab — ผู้เรียนได้ Windows endpoint ที่ติดตั้ง Vision One agent ให้อัตโนมัติ แล้วฝึกใช้งานผ่าน console",
+  "os": "windows-2022",
+  "instance_type": "t3.medium",
+  "root_volume_gb": 50,
+  "extra_open_ports": [],
+  "bootstrap_template": "bootstrap.ps1.tpl",
+  "lab_guide": "guide.md",
+  "params": {
+    "CONSOLE_URL": {
+      "required": true,
+      "description": "URL ของ Trend Vision One console เช่น https://portal.xdr.trendmicro.com"
+    },
+    "AGENT_INSTALLER_URL": {
+      "required": true,
+      "description": "ลิงก์ดาวน์โหลด agent installer ของ tenant คุณ (Vision One console → Endpoint Inventory → Agent Installer → คัดลอกลิงก์ .zip/.msi สำหรับ Windows Server)"
+    },
+    "AGENT_INSTALL_ARGS": {
+      "required": false,
+      "default": "",
+      "description": "อาร์กิวเมนต์เพิ่มเติมตอนติดตั้ง agent (ถ้ามี)"
+    }
+  }
+}

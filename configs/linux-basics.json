@@ -1,0 +1,13 @@
+{
+  "lab_name": "linux-basics",
+  "title": "Linux พื้นฐานสำหรับผู้เริ่มต้น",
+  "region": "ap-southeast-1",
+  "os": "ubuntu-22.04",
+  "instance_type": "t3.small",
+  "users": ["somchai", "somsri", "wichai"],
+  "allowed_cidr": "0.0.0.0/0",
+  "extra_open_ports": [],
+  "root_volume_gb": 20,
+  "expire_date": "2026-07-31",
+  "lab_guide": "lab-guides/linux-basics.md"
+}

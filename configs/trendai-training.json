@@ -1,0 +1,12 @@
+{
+  "lab_name": "trendai-training",
+  "product": "trend-vision-one",
+  "region": "ap-southeast-1",
+  "users": ["user01", "user02", "user03"],
+  "allowed_cidr": "0.0.0.0/0",
+  "expire_date": "2026-08-31",
+  "product_params": {
+    "CONSOLE_URL": "https://portal.xdr.trendmicro.com",
+    "AGENT_INSTALLER_URL": "https://REPLACE-WITH-YOUR-TENANT-INSTALLER-LINK/agent.zip"
+  }
+}

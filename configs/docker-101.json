@@ -1,0 +1,14 @@
+{
+  "lab_name": "docker-101",
+  "title": "Docker 101 — Container พื้นฐาน",
+  "region": "ap-southeast-1",
+  "os": "ubuntu-24.04",
+  "instance_type": "t3.medium",
+  "users": ["user01", "user02", "user03", "user04", "user05"],
+  "allowed_cidr": "0.0.0.0/0",
+  "extra_open_ports": [80, 8080],
+  "root_volume_gb": 30,
+  "expire_date": "2026-07-31",
+  "lab_guide": "lab-guides/docker-101.md",
+  "bootstrap_script": "bootstrap/docker.sh"
+}

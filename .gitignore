@@ -1,0 +1,10 @@
+# credentials / generated output — ห้าม commit
+keys/
+handouts/
+
+# terraform state & workdir
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate*
+terraform/terraform.tfstate.d/
+terraform/*.tfvars.json
