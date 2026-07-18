@@ -34,7 +34,30 @@ brew install terraform awscli        # macOS
 aws configure                        # ใส่ AWS credentials (ต้องมีสิทธิ์ EC2 + VPC)
 ```
 
-Python 3.9+ (มากับ macOS อยู่แล้ว) — ไม่ต้องลง library เพิ่ม
+Python 3.9+ (มากับ macOS อยู่แล้ว) — CLI ไม่ต้องลง library เพิ่ม
+
+## Web UI
+
+นอกจาก CLI มี web UI ให้ใช้ในเครื่อง: เชื่อมต่อ AWS → เลือก product จาก card →
+กรอกข้อมูล tenant → ดู terraform รันสด ๆ → dashboard รวมทุกเครื่อง
+พร้อมปุ่มดาวน์โหลด handout / refresh / destroy
+
+```bash
+pip3 install --user fastapi 'uvicorn[standard]'   # ครั้งแรกครั้งเดียว
+python3 labctl.py serve                            # เปิด http://127.0.0.1:8787
+```
+
+**เชื่อมต่อ AWS จากหน้าเว็บได้เลย** — ไม่ต้องมี aws CLI:
+มุมขวาบนมีสถานะการเชื่อมต่อ ถ้ายังไม่เชื่อมต่อ กดเข้าไปใส่ Access Key ID / Secret Access Key
+(+ Session Token ถ้าใช้ credential ชั่วคราว) ระบบตรวจกับ AWS (STS) ให้ก่อนใช้จริง
+เลือก "จำไว้ในเครื่องนี้" จะบันทึกลง `~/.aws/credentials` โปรไฟล์ `labctl`
+(ที่เดียวกับ `aws configure`) — เชื่อมต่อสำเร็จแล้วกดสร้าง hands-on lab ต่อได้ทันที
+
+- ผูกกับ `127.0.0.1` เท่านั้น — ไม่เปิดให้เครื่องอื่นในวง Wi-Fi เห็น (ใน handout มี key/รหัสผ่าน)
+- lab ที่สร้างจาก CLI ก็โผล่ในหน้า web และกลับกัน — ใช้ Terraform workspace ชุดเดียวกัน
+- ระหว่าง provisioning ปิดหน้าเว็บได้ งานรันต่อเบื้องหลังจนจบ
+- ไฟล์ `labs.db` (สถานะ lab/job) กับ `logs/` (log ของแต่ละงาน) สร้างอัตโนมัติ — อยู่ใน `.gitignore` แล้ว
+- frontend ไม่ต้องมี Node/npm — เป็น static file ใน `frontend/` เสิร์ฟตรงจาก server
 
 ## วิธีใช้งาน
 

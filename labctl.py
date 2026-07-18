@@ -59,6 +59,27 @@ def info(msg):
     print(f"[labctl] {msg}")
 
 
+class ConfigError(ValueError):
+    """config ไม่ผ่านการตรวจสอบ — CLI แปลงเป็น die(), ฝั่ง API แปลงเป็น HTTP 400"""
+
+
+def validate_config(cfg):
+    for field in ("lab_name", "users"):
+        if field not in cfg:
+            raise ConfigError(f"config ต้องมี field '{field}'")
+    if not re.fullmatch(r"[a-z0-9-]{1,32}", cfg["lab_name"]):
+        raise ConfigError("lab_name ต้องเป็น a-z, 0-9, - เท่านั้น (ไม่เกิน 32 ตัว)")
+    if not cfg["users"]:
+        raise ConfigError("ต้องมี user อย่างน้อย 1 คน")
+    for u in cfg["users"]:
+        if not re.fullmatch(r"[a-z0-9-]{1,30}", u):
+            raise ConfigError(f"ชื่อ user '{u}' ต้องเป็น a-z, 0-9, - เท่านั้น")
+    osname = cfg.get("os", "amazon-linux-2023")
+    if osname not in SUPPORTED_OS:
+        raise ConfigError(f"os '{osname}' ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
+    return cfg
+
+
 def load_config(path):
     p = Path(path)
     if not p.exists():
@@ -67,21 +88,10 @@ def load_config(path):
         cfg = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         die(f"config ไม่ใช่ JSON ที่ถูกต้อง: {e}")
-
-    for field in ("lab_name", "users"):
-        if field not in cfg:
-            die(f"config ต้องมี field '{field}'")
-    if not re.fullmatch(r"[a-z0-9-]{1,32}", cfg["lab_name"]):
-        die("lab_name ต้องเป็น a-z, 0-9, - เท่านั้น (ไม่เกิน 32 ตัว)")
-    if not cfg["users"]:
-        die("ต้องมี user อย่างน้อย 1 คน")
-    for u in cfg["users"]:
-        if not re.fullmatch(r"[a-z0-9-]{1,30}", u):
-            die(f"ชื่อ user '{u}' ต้องเป็น a-z, 0-9, - เท่านั้น")
-    osname = cfg.get("os", "amazon-linux-2023")
-    if osname not in SUPPORTED_OS:
-        die(f"os '{osname}' ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
-    return cfg
+    try:
+        return validate_config(cfg)
+    except ConfigError as e:
+        die(str(e))
 
 
 def render_template(text, params):
@@ -110,7 +120,7 @@ def apply_product(cfg):
 
     products = list_products()
     if name not in products:
-        die(f"ไม่พบ product '{name}' — มีให้เลือก: {', '.join(products) or '(ยังไม่มี)'}")
+        raise ConfigError(f"ไม่พบ product '{name}' — มีให้เลือก: {', '.join(products) or '(ยังไม่มี)'}")
     meta = products[name]
     pdir = PRODUCTS_DIR / name
 
@@ -124,7 +134,7 @@ def apply_product(cfg):
             else:
                 params[key] = spec.get("default", "")
     if missing:
-        die(f"product '{name}' ต้องระบุ product_params เพิ่มใน config:\n" + "\n".join(missing))
+        raise ConfigError(f"product '{name}' ต้องระบุ product_params เพิ่มใน config:\n" + "\n".join(missing))
     cfg["_product_params"] = params
 
     # ค่า default จาก product (config เขียนทับได้)
@@ -140,7 +150,7 @@ def apply_product(cfg):
     if tpl_name and "bootstrap_script" not in cfg:
         tpl_path = pdir / tpl_name
         if not tpl_path.exists():
-            die(f"product '{name}' อ้างถึง template ที่ไม่มีอยู่: {tpl_path}")
+            raise ConfigError(f"product '{name}' อ้างถึง template ที่ไม่มีอยู่: {tpl_path}")
         script = render_template(tpl_path.read_text(encoding="utf-8"), params)
         if tpl_name.endswith(".ps1.tpl"):
             script = "<powershell>\n" + script + "\n</powershell>"
@@ -513,6 +523,23 @@ def cmd_destroy(cfg):
     info(f"ลบ lab '{cfg['lab_name']}' เรียบร้อย ✔")
 
 
+def cmd_serve():
+    """เปิด web UI บนเครื่องนี้ (127.0.0.1 เท่านั้น — ขอบเขตความเชื่อถือเดียวกับ CLI)"""
+    try:
+        import uvicorn
+    except ImportError:
+        die("ยังไม่ได้ติดตั้ง dependencies ของ web UI — รัน:\n"
+            "    pip3 install --user fastapi 'uvicorn[standard]'")
+    import threading
+    import webbrowser
+    from backend.app import app
+
+    url = "http://127.0.0.1:8787"
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    info(f"เปิด web UI ที่ {url}  (Ctrl+C เพื่อหยุด)")
+    uvicorn.run(app, host="127.0.0.1", port=8787, log_level="warning")
+
+
 def cmd_products():
     products = list_products()
     if not products:
@@ -533,18 +560,24 @@ def main():
     parser = argparse.ArgumentParser(
         description="Hands-on Lab Generator — สร้าง VM lab บน AWS แยกต่อ user")
     parser.add_argument("command",
-                        choices=["create", "status", "refresh", "destroy", "products"])
+                        choices=["create", "status", "refresh", "destroy", "products", "serve"])
     parser.add_argument("config", nargs="?", help="ไฟล์ config ของ lab (JSON)")
     args = parser.parse_args()
 
     if args.command == "products":
         cmd_products()
         return
+    if args.command == "serve":
+        cmd_serve()
+        return
 
     if not args.config:
         die(f"คำสั่ง {args.command} ต้องระบุไฟล์ config ด้วย")
     check_prereqs()
-    cfg = apply_product(load_config(args.config))
+    try:
+        cfg = apply_product(load_config(args.config))
+    except ConfigError as e:
+        die(str(e))
     {"create": cmd_create, "status": cmd_status,
      "refresh": cmd_refresh, "destroy": cmd_destroy}[args.command](cfg)
 

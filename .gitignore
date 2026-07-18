@@ -8,3 +8,8 @@ terraform/.terraform.lock.hcl
 terraform/terraform.tfstate*
 terraform/terraform.tfstate.d/
 terraform/*.tfvars.json
+
+# web UI sidecar
+labs.db
+logs/
+__pycache__/
