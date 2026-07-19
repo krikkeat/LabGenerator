@@ -54,6 +54,24 @@ variable "root_volume_gb" {
   default     = 30
 }
 
+variable "custom_ami" {
+  description = "AMI ID ของตัวเอง (BYOL เช่น Windows 10/11 ที่ import มา) — ถ้าระบุจะไม่ใช้ os_catalog"
+  type        = string
+  default     = ""
+}
+
+variable "custom_username" {
+  description = "username สำหรับเข้าเครื่องเมื่อใช้ custom_ami"
+  type        = string
+  default     = ""
+}
+
+variable "custom_is_windows" {
+  description = "custom_ami เป็น Windows หรือไม่ (มีผลกับ RDP/SSH และการถอดรหัสผ่าน)"
+  type        = bool
+  default     = false
+}
+
 variable "user_data" {
   description = "สคริปต์ bootstrap ที่จะรันตอน VM บูตครั้งแรก (cloud-init / PowerShell)"
   type        = string

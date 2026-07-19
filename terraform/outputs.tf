@@ -5,7 +5,7 @@ output "lab_info" {
       instance_id = aws_instance.lab[u].id
       public_ip   = aws_instance.lab[u].public_ip
       public_dns  = aws_instance.lab[u].public_dns
-      os          = var.os
+      os          = local.os_display
       username    = local.os.username
       is_windows  = local.os.is_windows
     }
@@ -32,6 +32,6 @@ output "lab_meta" {
   value = {
     lab_name = var.lab_name
     region   = var.region
-    os       = var.os
+    os       = local.os_display
   }
 }

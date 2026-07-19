@@ -4,7 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>labctl — Hands-on Lab Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="./styles.css">
+<script>
+// ตั้ง theme ก่อน render กันจอกะพริบ — ค่าที่ผู้ใช้เลือกไว้ชนะ, ไม่เคยเลือกตามระบบ
+(function () {
+  var saved = localStorage.getItem('labctl-theme');
+  var theme = saved || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  addEventListener('DOMContentLoaded', function () { document.body.dataset.theme = theme; });
+})();
+</script>
 <script type="importmap">
 {
   "imports": {

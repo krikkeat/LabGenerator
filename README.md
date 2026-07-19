@@ -47,12 +47,19 @@ pip3 install --user fastapi 'uvicorn[standard]'   # ครั้งแรกค�
 python3 labctl.py serve                            # เปิด http://127.0.0.1:8787
 ```
 
+**เข้าสู่ระบบก่อนใช้งาน** — เปิดครั้งแรกระบบให้ตั้งบัญชีผู้ดูแล (username + รหัสผ่าน ≥8 ตัว)
+เก็บเป็น hash ใน `labs.db` ในเครื่องเท่านั้น ทุก API ต้อง login ก่อนใช้
+(ติ๊ก "จำไว้ในเครื่องนี้" = 30 วัน ไม่ติ๊ก = 12 ชั่วโมง) — มีปุ่มสลับ Light/Dark และออกจากระบบใน sidebar
+
 **เชื่อมต่อ AWS จากหน้าเว็บได้เลย** — ไม่ต้องมี aws CLI:
 มุมขวาบนมีสถานะการเชื่อมต่อ ถ้ายังไม่เชื่อมต่อ กดเข้าไปใส่ Access Key ID / Secret Access Key
 (+ Session Token ถ้าใช้ credential ชั่วคราว) ระบบตรวจกับ AWS (STS) ให้ก่อนใช้จริง
 เลือก "จำไว้ในเครื่องนี้" จะบันทึกลง `~/.aws/credentials` โปรไฟล์ `labctl`
 (ที่เดียวกับ `aws configure`) — เชื่อมต่อสำเร็จแล้วกดสร้าง hands-on lab ต่อได้ทันที
 
+- **Auto-expire**: lab ที่สร้างจาก web UI ถูกลบอัตโนมัติหลังครบเวลา session (default 8 ชั่วโมง —
+  กำหนดเองได้ตอนสร้าง หรือใส่ 0 เพื่อปิด) กันลืม destroy แล้วโดนคิดเงินข้ามคืน
+  ตัวจับเวลาทำงานตอน server เปิดอยู่ — ถ้าปิด server ไปตอนครบเวลา จะลบทันทีที่เปิดครั้งถัดไป
 - ผูกกับ `127.0.0.1` เท่านั้น — ไม่เปิดให้เครื่องอื่นในวง Wi-Fi เห็น (ใน handout มี key/รหัสผ่าน)
 - lab ที่สร้างจาก CLI ก็โผล่ในหน้า web และกลับกัน — ใช้ Terraform workspace ชุดเดียวกัน
 - ระหว่าง provisioning ปิดหน้าเว็บได้ งานรันต่อเบื้องหลังจนจบ
@@ -92,6 +99,17 @@ python3 labctl.py serve                            # เปิด http://127.0.0
 | `lab_guide` | ไฟล์ markdown ที่จะฝังลงใน handout ของผู้เรียน |
 | `bootstrap_script` | สคริปต์ติดตั้งโปรแกรมอัตโนมัติตอน VM บูต (optional) |
 | `expire_date` | ติด tag `Expire` บนทุก resource เพื่อช่วยตามลบ |
+| `custom_ami` | ใช้ AMI ของตัวเองแทน `os` (BYOL) — ต้องระบุ `custom_username` ด้วย และใส่ `custom_is_windows: true` ถ้าเป็น Windows |
+
+### Windows 10/11 (Windows Client)
+
+AWS **ไม่มี AMI สาธารณะของ Windows 10/11** — Microsoft อนุญาตให้รัน Windows client OS
+บน cloud เฉพาะ image ที่องค์กร **import เองพร้อม license ของตัวเอง** (BYOL ผ่าน
+[VM Import/Export](https://docs.aws.amazon.com/vm-import/latest/userguide/what-is-vmimport.html)
+และตามเงื่อนไข licensing ของ Microsoft อาจต้องใช้ Dedicated Host)
+ถ้ามี AMI ที่ import ไว้แล้ว ใส่ `custom_ami` ใน config หรือติ๊ก "ใช้ AMI ของตัวเอง (BYOL)"
+ใน web UI ได้เลย — สำหรับ training ทั่วไป **Windows Server 2025 (desktop experience)**
+หน้าตาใกล้ Windows 11 มากและใช้แทนได้โดยไม่ติดปัญหา license
 
 ### 2. สร้าง lab
 

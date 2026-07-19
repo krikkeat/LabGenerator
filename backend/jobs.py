@@ -160,6 +160,66 @@ def _run_job(job_id, kind, cfg):
             log.write(f"\n[job] ล้มเหลว: {msg}\n")
 
 
+def find_config_for(lab_name):
+    """หา config ของ lab: DB ก่อน (สร้างจาก UI) แล้วค่อย scan configs/*.json (สร้างจาก CLI)"""
+    import json
+    row = db.get_lab(lab_name)
+    if row and row.get("config_json"):
+        return json.loads(row["config_json"])
+    configs_dir = BASE_DIR / "configs"
+    if configs_dir.exists():
+        for p in sorted(configs_dir.glob("*.json")):
+            try:
+                cfg = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if cfg.get("lab_name") == lab_name:
+                return cfg
+    return None
+
+
+# ---------------------------------------------------------------------------
+# auto-expire — lab ที่ถึงเวลา expires_at ถูกลบเองแม้ผู้สอนลืม
+# (ทำงานเฉพาะตอน server เปิดอยู่ — ถ้าปิดอยู่ตอนครบเวลา จะลบทันทีที่เปิดครั้งถัดไป)
+# ---------------------------------------------------------------------------
+
+_scheduler_started = False
+
+
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    threading.Thread(target=_expiry_loop, daemon=True).start()
+
+
+def _expiry_loop():
+    while True:
+        try:
+            now = time.time()
+            for lab in db.list_labs():
+                if lab["status"] != "active":
+                    continue
+                exp = lab.get("expires_at")
+                if not exp or exp > now:
+                    continue
+                last = db.latest_job_for_lab(lab["lab_name"])
+                if last and last["kind"] == "destroy" and last["state"] in ("queued", "running"):
+                    continue  # กำลังลบอยู่แล้ว
+                cfg = find_config_for(lab["lab_name"])
+                if not cfg:
+                    continue
+                try:
+                    cfg = labctl.apply_product(labctl.validate_config(dict(cfg)))
+                except labctl.ConfigError:
+                    continue
+                enqueue("destroy", cfg)
+        except Exception:
+            pass  # scheduler ต้องไม่ตายเพราะ error ชั่วคราว
+        time.sleep(60)
+
+
 def enqueue(kind, cfg):
     job_id = uuid.uuid4().hex[:12]
     log_path = LOGS_DIR / f"{job_id}.log"

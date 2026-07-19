@@ -80,9 +80,17 @@ def validate_config(cfg):
     for u in cfg["users"]:
         if not re.fullmatch(r"[a-z0-9-]{1,30}", u):
             raise ConfigError(f"ชื่อ user '{u}' ต้องเป็น a-z, 0-9, - เท่านั้น")
-    osname = cfg.get("os", "amazon-linux-2023")
-    if osname not in SUPPORTED_OS:
-        raise ConfigError(f"os '{osname}' ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
+    if cfg.get("custom_ami"):
+        # BYOL — เช่น Windows 10/11 ที่ import license เอง
+        if not re.fullmatch(r"ami-[0-9a-f]{8,17}", cfg["custom_ami"]):
+            raise ConfigError("custom_ami ต้องเป็นรูปแบบ ami-xxxxxxxx")
+        if not cfg.get("custom_username"):
+            raise ConfigError("ใช้ custom_ami ต้องระบุ custom_username ด้วย "
+                              "(เช่น Administrator สำหรับ Windows)")
+    else:
+        osname = cfg.get("os", "amazon-linux-2023")
+        if osname not in SUPPORTED_OS:
+            raise ConfigError(f"os '{osname}' ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
     return cfg
 
 
@@ -203,6 +211,9 @@ def build_tfvars(cfg):
         "extra_open_ports": cfg.get("extra_open_ports", []),
         "root_volume_gb": cfg.get("root_volume_gb", 30),
         "expire_date": cfg.get("expire_date", ""),
+        "custom_ami": cfg.get("custom_ami", ""),
+        "custom_username": cfg.get("custom_username", ""),
+        "custom_is_windows": bool(cfg.get("custom_is_windows", False)),
     }
     bootstrap = cfg.get("bootstrap_script", "")
     if bootstrap:

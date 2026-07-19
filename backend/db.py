@@ -40,19 +40,28 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    # migration สำหรับ labs.db ที่สร้างก่อนมีระบบ auto-expire
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(labs)")}
+    if "ttl_hours" not in cols:
+        conn.execute("ALTER TABLE labs ADD COLUMN ttl_hours REAL")
+    if "expires_at" not in cols:
+        conn.execute("ALTER TABLE labs ADD COLUMN expires_at REAL")
     return conn
 
 
-def upsert_lab(lab_name, product, status, expire_date, config):
+def upsert_lab(lab_name, product, status, expire_date, config,
+               ttl_hours=None, expires_at=None):
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO labs (lab_name, product, status, created_at, expire_date, config_json)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO labs (lab_name, product, status, created_at, expire_date,
+                                 config_json, ttl_hours, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(lab_name) DO UPDATE SET
                  product=excluded.product, status=excluded.status,
-                 expire_date=excluded.expire_date, config_json=excluded.config_json""",
+                 expire_date=excluded.expire_date, config_json=excluded.config_json,
+                 ttl_hours=excluded.ttl_hours, expires_at=excluded.expires_at""",
             (lab_name, product, status, time.time(), expire_date,
-             json.dumps(config, ensure_ascii=False)),
+             json.dumps(config, ensure_ascii=False), ttl_hours, expires_at),
         )
 
 

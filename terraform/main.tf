@@ -66,7 +66,15 @@ locals {
     }
   }
 
-  os = local.os_catalog[var.os]
+  # custom_ami (BYOL — เช่น Windows 10/11 ที่ import เอง) ชนะ os_catalog
+  use_custom = var.custom_ami != ""
+  os = local.use_custom ? {
+    ssm_parameter = ""
+    username      = var.custom_username
+    is_windows    = var.custom_is_windows
+  } : local.os_catalog[var.os]
+
+  os_display = local.use_custom ? "custom (${var.custom_ami})" : var.os
 
   # พอร์ตพื้นฐานตาม OS + พอร์ตเพิ่มเติมจาก config
   base_ports = local.os.is_windows ? [3389] : [22]
@@ -74,7 +82,8 @@ locals {
 }
 
 data "aws_ssm_parameter" "ami" {
-  name = local.os.ssm_parameter
+  count = local.use_custom ? 0 : 1
+  name  = local.os.ssm_parameter
 }
 
 data "aws_availability_zones" "available" {
@@ -168,7 +177,7 @@ resource "aws_key_pair" "user" {
 resource "aws_instance" "lab" {
   for_each = toset(var.users)
 
-  ami                    = data.aws_ssm_parameter.ami.value
+  ami                    = local.use_custom ? var.custom_ami : data.aws_ssm_parameter.ami[0].value
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.lab.id]
