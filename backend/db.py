@@ -5,12 +5,18 @@ IP / instance id / OS อ่านสดจาก terraform output เสมอ 
 """
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "labs.db"
+
+# เก็บนอกโฟลเดอร์ที่ OneDrive ซิงก์ ด้วยเหตุผลเดียวกับ terraform state — ตัวซิงก์
+# แตะไฟล์ใต้เท้า SQLite ได้ ทำให้ไฟล์เสียหรือ lock เพี้ยน (ดู POSTMORTEM-state-loss.md)
+DB_PATH = Path(os.environ.get("LABCTL_DB_PATH",
+                              Path.home() / ".lab-generator" / "labs.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS labs (
@@ -65,6 +71,13 @@ def upsert_lab(lab_name, product, status, expire_date, config,
         )
 
 
+def update_lab_config(lab_name, config):
+    """แก้เฉพาะ config ของ lab — ไม่แตะ status/expires_at ที่กำลังนับถอยหลังอยู่"""
+    with get_conn() as conn:
+        conn.execute("UPDATE labs SET config_json=? WHERE lab_name=?",
+                     (json.dumps(config, ensure_ascii=False), lab_name))
+
+
 def set_lab_status(lab_name, status):
     with get_conn() as conn:
         conn.execute("UPDATE labs SET status=? WHERE lab_name=?", (status, lab_name))
@@ -101,6 +114,13 @@ def get_job(job_id):
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
+
+
+def list_jobs(limit=2000):
+    """ประวัติ job ทั้งหมด — ใช้คำนวณชั่วโมงเครื่องย้อนหลัง"""
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()]
 
 
 def latest_job_for_lab(lab_name):

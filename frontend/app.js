@@ -274,7 +274,9 @@ function Home({ labs, loaded }) {
   function open(l) {
     if (['provisioning', 'queued', 'destroying'].includes(l.status) && l.job) {
       nav(`/job/${l.job.id}?lab=${l.lab_name}`);
-    } else if (l.status === 'error' && l.job) {
+    } else if (l.status === 'error' && l.job && l.job.kind !== 'destroy') {
+      // destroy ที่ล้มเหลวต้องพาไปหน้า dashboard ไม่ใช่หน้า log — ไม่งั้นผู้ใช้
+      // ไปกด Destroy ซ้ำไม่ได้เลย (log ยังกดดูได้จากปุ่มในหน้านั้น)
       nav(`/job/${l.job.id}?lab=${l.lab_name}`);
     } else {
       nav(`/lab/${l.lab_name}`);
@@ -338,6 +340,81 @@ function Home({ labs, loaded }) {
 
 const CUSTOM = '__custom__';
 
+// เลือก hands-on lab guide ตั้งแต่ก่อน gen — อ่านไฟล์ในเบราว์เซอร์แล้วส่งเป็น
+// ข้อความไปกับ body ตอนสร้าง (ไม่ต้องมี endpoint upload แยกและไม่ต้องพึ่ง multipart)
+// value = { mode, path, markdown, filename }
+function GuidePicker({ value, onChange, productGuide }) {
+  const [guides, setGuides] = useState([]);
+  const [fileErr, setFileErr] = useState(null);
+
+  useEffect(() => { api('/lab-guides').then(r => setGuides(r.guides)).catch(() => {}); }, []);
+
+  function readFile(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    setFileErr(null);
+    if (f.size > 512 * 1024) { setFileErr('ไฟล์ใหญ่เกิน 512 KB'); return; }
+    const rd = new FileReader();
+    rd.onload = () => onChange({ ...value, markdown: String(rd.result), filename: f.name });
+    rd.onerror = () => setFileErr('อ่านไฟล์ไม่สำเร็จ');
+    rd.readAsText(f);
+  }
+
+  const selected = guides.find(g => g.path === value.path);
+
+  async function removeGuide() {
+    setFileErr(null);
+    try {
+      await api('/lab-guides/delete', { method: 'POST', body: JSON.stringify({ path: value.path }) });
+      setGuides(gs => gs.filter(g => g.path !== value.path));
+      onChange({ ...value, path: '' });
+    } catch (e) { setFileErr(e.message); }
+  }
+
+  const tab = (m, label) => html`
+    <button type="button" class="btn ghost small"
+      style=${value.mode === m ? 'border-color:var(--accent); color:var(--accent)' : ''}
+      onClick=${() => onChange({ ...value, mode: m })}>${label}</button>`;
+
+  return html`
+    <div class="field">
+      <label>Hands-on Lab Guide
+        <span class="opt">แนบตอนนี้ได้เลย — จะถูกรวมเข้า handout พร้อมวิธี remote เข้าเครื่องหลังสร้างเสร็จ</span></label>
+      <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap">
+        ${tab('upload', '⤒ อัปโหลดไฟล์')}
+        ${tab('pick', 'เลือกจากที่มี')}
+        ${tab('none', 'ยังไม่ใส่')}
+      </div>
+
+      ${value.mode === 'upload' && html`
+        <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain"
+          onChange=${readFile} style="font:400 12.5px var(--sans); padding:7px" />
+        ${value.filename && html`<div class="help">
+          แนบแล้ว: <b>${value.filename}</b> · ${(value.markdown || '').length.toLocaleString()} ตัวอักษร</div>`}
+        ${fileErr && html`<div class="help bad">${fileErr}</div>`}
+        ${!value.filename && !fileErr && html`<div class="help">
+          ไฟล์ Markdown (.md) — รองรับ # หัวข้อ, - รายการ, \`\`\` โค้ด, > quote</div>`}`}
+
+      ${value.mode === 'pick' && html`
+        <div style="display:flex; gap:8px; align-items:center">
+          <select value=${value.path} onChange=${(e) => onChange({ ...value, path: e.target.value })}>
+            <option value="">— เลือก lab guide —</option>
+            ${guides.map(g => html`<option value=${g.path} key=${g.path}>${g.name} · ${g.source}</option>`)}
+          </select>
+          ${selected?.deletable && html`
+            <button type="button" class="btn ghost small" style="flex:0 0 auto"
+              onClick=${removeGuide}>ลบไฟล์นี้</button>`}
+        </div>
+        ${selected?.deletable && html`<div class="help">
+          เป็นไฟล์ที่อัปโหลดไว้เอง — ลบได้ (guide ของ product ลบไม่ได้)</div>`}
+        ${fileErr && html`<div class="help bad">${fileErr}</div>`}`}
+
+      ${value.mode === 'none' && html`<div class="help">
+        ${productGuide ? `จะใช้ guide มาตรฐานของ ${productGuide}`
+          : 'handout จะมีเฉพาะวิธีเข้าเครื่อง — แนบ guide ทีหลังจากหน้า lab ได้'}</div>`}
+    </div>`;
+}
+
 function Wizard({ aws }) {
   const [catalog, setCatalog] = useState(null);
   const [step, setStep] = useState(0);
@@ -358,6 +435,7 @@ function Wizard({ aws }) {
     custom_is_windows: pre?.custom_is_windows ?? true,
   });
   const [params, setParams] = useState(pre?.product_params || {});
+  const [guide, setGuide] = useState({ mode: 'upload', path: '', markdown: '', filename: '' });
   useEffect(() => { PREFILL = null; }, []);
 
   useEffect(() => { api('/products').then(setCatalog).catch(e => setErr(e.message)); }, []);
@@ -406,6 +484,8 @@ function Wizard({ aws }) {
       body.product_params = Object.fromEntries(
         paramSpecs.map(([k]) => [k, (params[k] || '').trim()]).filter(([, v]) => v));
     }
+    if (guide.mode === 'upload' && guide.markdown.trim()) body.lab_guide_markdown = guide.markdown;
+    else if (guide.mode === 'pick' && guide.path) body.lab_guide = guide.path;
     if (form.instance_type) body.instance_type = form.instance_type;
     if (form.root_volume_gb) body.root_volume_gb = parseInt(form.root_volume_gb, 10);
     if (form.extra_open_ports.trim()) {
@@ -493,6 +573,7 @@ function Wizard({ aws }) {
                     onChange=${(e) => setForm({ ...form, custom_is_windows: e.target.checked })} />
                   AMI นี้เป็น Windows (ใช้ RDP + ถอดรหัสผ่านจาก key)
                 </label></div>`}`}
+            <${GuidePicker} value=${guide} onChange=${setGuide} productGuide=${meta?.lab_guide ? meta.product_name : null} />
             <details style="margin-top:4px">
               <summary style="font:500 12.5px var(--mono); color:var(--ink-dim); cursor:pointer; margin-bottom:10px">ขั้นสูง (instance_type, root_volume_gb, extra_open_ports)</summary>
               <div class="row">
@@ -529,6 +610,11 @@ function Wizard({ aws }) {
                 <span class="v">${nUsers} × ${isCustom && form.byol ? `AMI ${form.custom_ami}` : (OS_LABELS[effOS] || effOS)}, ${effType}</span></div>
               <div class="review-row"><span class="k">Auto-expire</span>
                 <span class="v">${ttlNum > 0 ? `ลบอัตโนมัติหลัง ${form.ttl_hours} ชั่วโมง` : 'ปิด — ต้องกด Destroy เองตอนจบ'}</span></div>
+              <div class="review-row"><span class="k">Lab guide</span>
+                <span class="v">${guide.mode === 'upload' && guide.filename ? `${guide.filename} (อัปโหลด)`
+                  : guide.mode === 'pick' && guide.path ? guide.path
+                  : meta?.lab_guide ? `guide มาตรฐานของ ${meta.product_name}`
+                  : 'ไม่ใส่ — handout จะมีเฉพาะวิธีเข้าเครื่อง'}</span></div>
               <div class="review-row"><span class="k">Region</span><span class="v">${form.region}</span></div>
               <div class="review-row"><span class="k">ผู้เรียน</span><span class="v">${form.users.join(', ')}</span></div>
               ${!isCustom && paramSpecs.filter(([, s]) => s.required).map(([k]) => html`
@@ -612,6 +698,7 @@ const PHASES = {
     ['done', 'เสร็จสิ้น'],
   ],
   refresh: [['refresh', 'ดึงสถานะล่าสุดจาก AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
+  export: [['export', 'สร้าง handout + zip ใหม่'], ['done', 'เสร็จสิ้น']],
   destroy: [['destroy', 'ลบ resource ทั้งหมดบน AWS'], ['cleanup', 'ลบ key/handout ในเครื่อง'], ['done', 'เสร็จสิ้น']],
 };
 
@@ -662,8 +749,10 @@ function JobView({ jobId, labName }) {
   return html`
     <div class="screen" style="max-width:920px">
       <h1 class="page-title" style="margin-bottom:16px">
-        ${done ? (failed ? 'งานล้มเหลว' : kind === 'destroy' ? 'ลบเสร็จแล้ว' : 'สร้างเสร็จแล้ว')
-          : kind === 'destroy' ? 'กำลังลบ' : kind === 'refresh' ? 'กำลัง refresh' : 'กำลังสร้าง'}
+        ${done ? (failed ? 'งานล้มเหลว' : kind === 'destroy' ? 'ลบเสร็จแล้ว'
+            : kind === 'export' ? 'สร้าง handout ใหม่เสร็จแล้ว' : 'สร้างเสร็จแล้ว')
+          : kind === 'destroy' ? 'กำลังลบ' : kind === 'refresh' ? 'กำลัง refresh'
+          : kind === 'export' ? 'กำลังสร้าง handout ใหม่' : 'กำลังสร้าง'}
         ${' '}<span class="mono muted" style="font:500 14px var(--mono)">${labName}</span></h1>
       <div class="card">
         <div class="job-progress"><div class="fill" style="width:${pct}%; ${failed ? 'background:var(--crit)' : ''}"></div></div>
@@ -689,7 +778,9 @@ function JobView({ jobId, labName }) {
             ? html`
               ${!failed && html`<span class="job-done-note">✓ เสร็จสิ้น${elapsed ? `ใน ${elapsed}` : ''}</span>`}
               <button class="btn ghost" onClick=${() => nav('/')}>← หน้าแรก</button>
-              ${kind !== 'destroy' && html`<button class="btn primary"
+              ${/* destroy ที่สำเร็จแล้วไม่มี lab ให้เปิด — แต่ถ้าล้มเหลว lab ยังอยู่
+                    และต้องกลับไปหน้า dashboard เพื่อกด Destroy ซ้ำได้ */
+                (kind !== 'destroy' || failed) && html`<button class="btn primary"
                 onClick=${() => nav(`/lab/${labName}`)}>เปิด dashboard ของ lab →</button>`}`
             : html`
               <span class="job-run-note">ปิดหน้านี้ได้ — งานยังรันต่อเบื้องหลัง</span>
@@ -703,6 +794,129 @@ function JobView({ jobId, labName }) {
 // dashboard — machine cards
 // ---------------------------------------------------------------------------
 
+// แนบ/เปลี่ยน lab guide หลัง lab ถูกสร้างไปแล้ว — สร้าง handout ใหม่อย่างเดียว
+// ไม่แตะ VM จึงกดซ้ำได้ระหว่างสอนโดยไม่กระทบผู้เรียนที่ต่ออยู่
+function GuideCard({ labName, disabled, onDone }) {
+  const [guides, setGuides] = useState([]);
+  const [current, setCurrent] = useState(null);
+  const [choice, setChoice] = useState('');
+  const [markdown, setMarkdown] = useState('');
+  const [mode, setMode] = useState('pick');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [okMsg, setOkMsg] = useState(null);
+  const [jobId, setJobId] = useState(null);
+
+  useEffect(() => {
+    api('/lab-guides').then(r => setGuides(r.guides)).catch(e => setErr(e.message));
+    api(`/labs/${labName}/guide`).then((g) => {
+      setCurrent(g);
+      setChoice(g.lab_guide || '');
+      if (g.content) setMarkdown(g.content);
+    }).catch(() => { /* lab ที่ไม่มี config ไม่ต้องแสดง current */ });
+  }, [labName]);
+
+  // สร้าง handout ใหม่แล้วอยู่หน้าเดิม — งานนี้ไม่แตะ terraform จึงจบในไม่กี่วินาที
+  // พาไปหน้า log แล้วให้เดินกลับมากดดาวน์โหลดเองมีแต่ทำให้เสียจังหวะ
+  async function apply() {
+    setBusy(true); setErr(null); setOkMsg(null);
+    try {
+      const body = mode === 'write' ? { markdown } : { guide: choice };
+      const r = await api(`/labs/${labName}/guide`, { method: 'PUT', body: JSON.stringify(body) });
+      for (let i = 0; i < 90; i++) {
+        await new Promise(res => setTimeout(res, 1000));
+        const job = await api(`/jobs/${r.job_id}`);
+        if (job.state === 'success') {
+          setOkMsg('สร้าง handout ใหม่แล้ว — ดาวน์โหลด zip ด้านล่างได้เลย');
+          setCurrent(await api(`/labs/${labName}/guide`));
+          if (onDone) onDone();
+          setBusy(false);
+          return;
+        }
+        if (job.state === 'error') {
+          setErr(job.error || 'สร้าง handout ไม่สำเร็จ');
+          setJobId(r.job_id);
+          setBusy(false);
+          return;
+        }
+      }
+      setJobId(r.job_id);
+      setErr('งานใช้เวลานานผิดปกติ — เปิดดู log ได้จากลิงก์ด้านล่าง');
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  const canApply = !busy && !disabled && (mode === 'write' ? markdown.trim() : choice);
+
+  return html`
+    <div class="card" style="margin-top:18px">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
+        <div>
+          <div style="font:700 14px var(--sans)">เปลี่ยน Hands-on Lab Guide</div>
+          <div class="muted" style="font:400 12.5px var(--sans); margin-top:3px">
+            ${current?.lab_guide
+              ? html`ใช้อยู่: <span class="mono">${current.lab_guide}</span>${current.exists ? '' : ' (ไม่พบไฟล์)'}`
+              : 'lab นี้ยังไม่มี guide — แนบตอนนี้แล้วสร้าง handout ใหม่ได้'}
+          </div>
+        </div>
+        <div style="display:flex; gap:6px">
+          <button class="btn ghost small" style=${mode === 'pick' ? 'border-color:var(--accent)' : ''}
+            onClick=${() => setMode('pick')}>เลือกไฟล์ที่มี</button>
+          <button class="btn ghost small" style=${mode === 'write' ? 'border-color:var(--accent)' : ''}
+            onClick=${() => setMode('write')}>เขียน/วางเอง</button>
+        </div>
+      </div>
+
+      <${ErrBox} err=${err} />
+
+      ${current && !current.lab_guide && html`
+        <div class="warn-box">
+          handout ที่ดาวน์โหลดตอนนี้จะมีแต่วิธีเข้าเครื่อง ยังไม่มีเนื้อหา lab —
+          แนบ guide ตรงนี้ก่อนแล้วค่อยแจก zip ให้ผู้เรียน
+        </div>`}
+      ${current && current.lab_guide && !current.exists && html`
+        <div class="err">ไฟล์ <span class="mono">${current.lab_guide}</span> หายไปจากเครื่อง —
+          handout รอบหน้าจะไม่มีเนื้อหา guide จนกว่าจะแนบใหม่</div>`}
+
+      ${mode === 'pick' ? html`
+        <div class="field" style="margin-top:12px">
+          <select value=${choice} onChange=${(e) => setChoice(e.target.value)}>
+            <option value="">— เลือก lab guide —</option>
+            ${guides.map(g => html`
+              <option value=${g.path} key=${g.path}>${g.name} · ${g.source}</option>`)}
+          </select>
+        </div>`
+      : html`
+        <div class="field" style="margin-top:12px">
+          <label>Markdown <span class="opt">อัปโหลดไฟล์มาแก้ต่อ หรือพิมพ์เองก็ได้</span></label>
+          <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain"
+            style="font:400 12.5px var(--sans); padding:7px; margin-bottom:8px"
+            onChange=${(e) => {
+              const f = e.target.files && e.target.files[0];
+              if (!f) return;
+              if (f.size > 512 * 1024) { setErr('ไฟล์ใหญ่เกิน 512 KB'); return; }
+              const rd = new FileReader();
+              rd.onload = () => { setErr(null); setMarkdown(String(rd.result)); };
+              rd.readAsText(f);
+            }} />
+          <textarea rows="12" value=${markdown} placeholder="# ขั้นตอนที่ 1\n..."
+            style="font:400 12.5px var(--mono); resize:vertical"
+            onInput=${(e) => setMarkdown(e.target.value)}></textarea>
+        </div>`}
+
+      ${okMsg && html`<div class="ok-box" style="margin-top:12px">✔ ${okMsg}</div>`}
+      ${jobId && html`<div class="help">
+        <a href="#/job/${jobId}?lab=${labName}">เปิดดู log ของงานนี้ →</a></div>`}
+
+      <div class="btnbar">
+        <span class="muted" style="font:400 12px var(--sans)">
+          สร้าง handout + zip ใหม่ทุกคน — ไม่แตะ VM ที่รันอยู่</span>
+        <button class="btn primary small" disabled=${!canApply} onClick=${apply}>
+          ${busy ? 'กำลังสร้าง handout…' : 'ใส่ guide แล้วสร้าง handout ใหม่'}</button>
+      </div>
+    </div>`;
+}
+
 function Dashboard({ labName }) {
   const [lab, setLab] = useState(null);
   const [err, setErr] = useState(null);
@@ -710,16 +924,41 @@ function Dashboard({ labName }) {
   const [copied, setCopied] = useState({});
   const [destroyOpen, setDestroyOpen] = useState(false);
   const [confirmText, setConfirmText] = useState('');
+  const [delGuide, setDelGuide] = useState(false);
+  const [guidePath, setGuidePath] = useState(null);
+  const [reach, setReach] = useState({});
+  const [reachBusy, setReachBusy] = useState(false);
 
   const load = useCallback(() => {
     api(`/labs/${labName}`).then(setLab).catch(e => setErr(e.message));
+    api(`/labs/${labName}/guide`).then(g => setGuidePath(g.lab_guide)).catch(() => {});
   }, [labName]);
   useEffect(load, [load]);
+
+  // guide ที่อัปโหลดให้ lab นี้โดยเฉพาะ — ตัวเดียวที่เสนอให้ลบพร้อม lab ได้
+  const ownGuide = guidePath && guidePath === `lab-guides/${labName}-custom.md`;
 
   function copyIp(m) {
     try { navigator.clipboard.writeText(m.public_ip); } catch (e) { /* noop */ }
     setCopied(c => ({ ...c, [m.user]: true }));
     setTimeout(() => setCopied(c => ({ ...c, [m.user]: false })), 1600);
+  }
+
+  // ตรวจว่าพอร์ต SSH/RDP เปิดรับแล้วหรือยัง — รู้ก่อนเริ่มคลาสว่าเครื่องไหนยังไม่พร้อม
+  async function checkReach() {
+    setReachBusy(true); setErr(null);
+    try {
+      const r = await api(`/labs/${labName}/reachability`);
+      setReach(Object.fromEntries(r.results.map(x => [x.user, x])));
+    } catch (e) { setErr(e.message); }
+    setReachBusy(false);
+  }
+
+  // เปิดคลาสเดิมรอบใหม่ — เติมค่าเดิมให้ wizard แล้วให้ผู้สอนแก้ชื่อ/ผู้เรียนเอง
+  function cloneLab() {
+    const c = lab.config || {};
+    PREFILL = { ...c, lab_name: '', ttl_hours: lab.ttl_hours ?? 8 };
+    nav('/new');
   }
 
   async function doRefresh() {
@@ -732,7 +971,8 @@ function Dashboard({ labName }) {
   async function doDestroy() {
     try {
       const r = await api(`/labs/${labName}`, {
-        method: 'DELETE', body: JSON.stringify({ confirm: confirmText }),
+        method: 'DELETE',
+        body: JSON.stringify({ confirm: confirmText, delete_guide: ownGuide && delGuide }),
       });
       setDestroyOpen(false);
       nav(`/job/${r.job_id}?lab=${labName}`);
@@ -760,6 +1000,11 @@ function Dashboard({ labName }) {
         <div style="display:flex; gap:8px; flex-wrap:wrap">
           ${busyJob && html`<button class="btn ghost small"
             onClick=${() => nav(`/job/${lab.job.id}?lab=${labName}`)}>ดูงานที่กำลังรัน →</button>`}
+          ${!busyJob && lab.job && lab.job.state === 'error' && html`<button class="btn ghost small"
+            onClick=${() => nav(`/job/${lab.job.id}?lab=${labName}`)}>ดู log ที่ล้มเหลว →</button>`}
+          <button class="btn ghost small" onClick=${checkReach} disabled=${reachBusy || busyJob}>
+            ${reachBusy ? 'กำลังตรวจ…' : '⇄ ตรวจการเชื่อมต่อ'}</button>
+          <button class="btn ghost small" onClick=${cloneLab}>⧉ สร้างซ้ำ</button>
           <button class="btn ghost small" onClick=${doRefresh} disabled=${busyJob}>↻ Refresh</button>
           <a class="btn ghost small" href="/api/labs/${labName}/handouts/export" download>⤓ Export ทั้งหมด</a>
           <button class="btn danger small" disabled=${busyJob}
@@ -767,6 +1012,9 @@ function Dashboard({ labName }) {
         </div>
       </div>
       <${ErrBox} err=${err} />
+
+      ${lab.status === 'active' && lab.machines.length > 0
+        && html`<${GuideCard} labName=${labName} disabled=${busyJob} onDone=${load} />`}
 
       ${lab.machines.length === 0
         ? html`<div class="card"><div class="empty">
@@ -779,7 +1027,10 @@ function Dashboard({ labName }) {
             <div class="mac-card" key=${m.user}>
               <div class="mac-head">
                 <div class="mac-user"><span class="mac-dot ${m.public_ip ? '' : 'off'}"></span>${m.user}</div>
-                <span class="mac-proto">${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
+                <span class="mac-proto">
+                  ${reach[m.user] && html`<span style="color:${reach[m.user].reachable ? 'var(--good)' : 'var(--crit)'}">
+                    ${reach[m.user].reachable ? `● พร้อม ${reach[m.user].ms}ms` : '● ต่อไม่ได้'} · </span>`}
+                  ${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
               </div>
               <div class="mac-rows">
                 <div><span class="k">Public IP</span>
@@ -818,6 +1069,12 @@ function Dashboard({ labName }) {
             <div class="flabel">พิมพ์ชื่อ lab เพื่อยืนยัน</div>
             <input type="text" value=${confirmText} placeholder=${labName}
               onInput=${(e) => setConfirmText(e.target.value)} />
+            ${ownGuide && html`
+              <label class="checkbox" style="margin-top:12px">
+                <input type="checkbox" checked=${delGuide}
+                  onChange=${(e) => setDelGuide(e.target.checked)} />
+                ลบไฟล์ lab guide ที่อัปโหลดไว้ด้วย (<span class="mono">${guidePath}</span>)
+              </label>`}
             <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:18px">
               <button class="btn ghost" onClick=${() => setDestroyOpen(false)}>ยกเลิก</button>
               <button class="btn danger" disabled=${confirmText !== labName}
@@ -832,6 +1089,66 @@ function Dashboard({ labName }) {
 // ---------------------------------------------------------------------------
 // aws page
 // ---------------------------------------------------------------------------
+
+// ถาม AWS ตรง ๆ ว่ามี resource ติด tag Project=hands-on-lab เหลืออยู่ไหม
+// ใช้ตอบคำถาม "ลบหมดจริงหรือยัง" ได้แม้ terraform state จะหายไปแล้ว
+function OrphanScan() {
+  const [res, setRes] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function scan() {
+    setBusy(true); setErr(null); setRes(null);
+    try { setRes(await api('/aws/orphans')); } catch (ex) { setErr(ex.message); }
+    setBusy(false);
+  }
+
+  const byLab = {};
+  (res?.resources || []).forEach((r) => {
+    const k = r.lab || '(ไม่มี tag LabName)';
+    (byLab[k] = byLab[k] || []).push(r);
+  });
+
+  return html`
+    <div class="card" style="margin-top:16px">
+      <div class="kv-row" style="border:0;padding:0">
+        <span class="k">ตรวจ resource ค้าง</span>
+        <button class="btn ghost small" onClick=${scan} disabled=${busy}>
+          ${busy ? 'กำลังถาม AWS…' : 'ตรวจเลย'}</button>
+      </div>
+      <p class="page-sub" style="margin:8px 0 0">
+        ถาม AWS ตรง ๆ ว่ายังมีของติด tag <code>Project=hands-on-lab</code> เหลืออยู่ไหม —
+        ไม่ได้อ่านจาก terraform state จึงเชื่อได้แม้ state จะหาย
+      </p>
+      <${ErrBox} err=${err} />
+      ${res && res.clean && html`
+        <div class="ok-box" style="margin-top:12px">
+          ✔ ไม่มี resource ค้าง — ตรวจแล้วที่ ${res.regions.join(', ')}
+        </div>`}
+      ${res && !res.clean && html`
+        <div style="margin-top:12px">
+          ${res.total > 0 && html`
+            <div class="err">พบ ${res.total} resource ที่ยังอยู่บน AWS — ยังเดินค่าใช้จ่ายอยู่</div>`}
+          ${Object.entries(byLab).map(([lab, rows]) => html`
+            <div class="kv-rows" style="margin-top:10px">
+              <div class="kv-row"><span class="k">lab</span><span class="v">${lab}</span></div>
+              ${rows.map((r) => html`
+                <div class="kv-row">
+                  <span class="k sans">${r.kind}</span>
+                  <span class="v">${r.id}${r.state ? ` · ${r.state}` : ''}${r.public_ip ? ` · ${r.public_ip}` : ''}
+                    <span class="sans" style="opacity:.6"> · ${r.region}</span></span>
+                </div>`)}
+            </div>`)}
+          ${(res.errors || []).map((e) => html`
+            <div class="err" style="margin-top:8px">ถาม ${e.kind} ที่ ${e.region} ไม่สำเร็จ: ${e.error}</div>`)}
+          ${res.total > 0 && html`
+            <p class="page-sub" style="margin:10px 0 0">
+              ลบตามลำดับนี้: EC2 (รอ terminated ก่อน) → security group → subnet → IGW →
+              route table → VPC → key pair
+            </p>`}
+        </div>`}
+    </div>`;
+}
 
 function AwsPage({ aws, onAws }) {
   const [form, setForm] = useState({
@@ -880,6 +1197,7 @@ function AwsPage({ aws, onAws }) {
             <button class="btn primary" onClick=${() => { PREFILL = null; nav('/new'); }}>สร้าง hands-on lab ได้เลย →</button>
           </div>
         </div>
+        <${OrphanScan} />
       </div>`;
   }
 
@@ -908,7 +1226,11 @@ function AwsPage({ aws, onAws }) {
             <input type="checkbox" checked=${form.remember}
               onChange=${(e) => setForm({ ...form, remember: e.target.checked })} />
             จำไว้ในเครื่องนี้ (~/.aws/credentials โปรไฟล์ labctl) — ปิดโปรแกรมแล้วไม่ต้องใส่ใหม่
-          </label></div>
+          </label>
+          ${!form.remember && html`<div class="help bad">
+            ไม่จำ = คีย์อยู่แค่ในหน่วยความจำของ server ตัวนี้ — หายทุกครั้งที่ปิด/restart
+            และคำสั่ง <span class="mono">labctl.py</span> ที่รันแยกจะมองไม่เห็นคีย์นี้</div>`}
+          </div>
           <div class="btnbar">
             <button type="button" class="btn ghost" onClick=${() => nav('/')}>ยกเลิก</button>
             <button type="submit" class="btn primary"

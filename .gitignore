@@ -13,3 +13,10 @@ terraform/*.tfvars.json
 labs.db
 logs/
 __pycache__/
+
+# terraform binary ที่วางไว้ในโปรเจกต์ (84 MB) — ดาวน์โหลดใหม่ได้ ดู README
+bin/
+
+# ขยะของ macOS / ร่องรอยการย้ายโปรเจกต์
+.DS_Store
+*.moved-to-home

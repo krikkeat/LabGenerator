@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import labctl
-from . import db
+from . import aws, db
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TF_DIR = BASE_DIR / "terraform"
@@ -30,15 +30,37 @@ _executor = ThreadPoolExecutor(max_workers=1)
 # กัน terraform สอง process แตะ backend/plugin dir พร้อมกันตอน init
 _tf_init_lock = threading.Lock()
 
+# ร่องรอยของ credential พังใน output ของ terraform — เอาไว้แปะคำแนะนำต่อท้าย
+# ข้อความ error แทนที่จะโยน stack ดิบ ๆ ของ AWS SDK ใส่หน้าผู้ใช้
+_CRED_MARKERS = ("ExpiredToken", "InvalidClientTokenId", "SignatureDoesNotMatch",
+                 "UnrecognizedClientException", "AuthFailure",
+                 "no EC2 IMDS role found", "failed to refresh cached credentials",
+                 "no valid providers in chain", "NoCredentialProviders")
+
 
 class JobFailure(Exception):
     pass
 
 
+def _cred_fail_msg():
+    return "\n\ncredential ของ AWS หมดอายุหรือใช้ไม่ได้แล้ว\n" + aws.RELOGIN_HINT
+
+
+def _cred_suffix(text):
+    return _cred_fail_msg() if any(m in text for m in _CRED_MARKERS) else ""
+
+
 def _tfrun(args, lab=None, log=None, capture=False):
     """รัน terraform; lab → ส่ง TF_WORKSPACE, log → stream ทีละบรรทัดลงไฟล์"""
-    cmd = ["terraform", f"-chdir={TF_DIR}"] + args
-    env = dict(os.environ)
+    exe = labctl.terraform_bin()
+    if exe is None:
+        raise JobFailure(labctl.TF_MISSING_MSG)
+    cmd = [exe, f"-chdir={TF_DIR}"] + args
+    try:
+        env = aws.terraform_env()      # ทางเดียวกับที่ CLI ใช้ — กติกาไม่แยกกันเพี้ยน
+    except aws.AwsError as e:
+        raise JobFailure(str(e)) from e
+    env.pop("AWS_PROFILE", None)       # คีย์ที่ยัดตรง ๆ ต้องชนะโปรไฟล์อื่น
     if lab:
         env["TF_WORKSPACE"] = lab
     else:
@@ -46,19 +68,73 @@ def _tfrun(args, lab=None, log=None, capture=False):
     if log is not None:
         log.write(f"$ terraform {' '.join(args)}\n")
         log.flush()
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+        try:
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            raise JobFailure(f"{labctl.TF_MISSING_MSG}\n(รายละเอียด: {e})") from e
+        cred_err = False
         for line in proc.stdout:
             log.write(line)
             log.flush()
+            if not cred_err and any(m in line for m in _CRED_MARKERS):
+                cred_err = True
         proc.wait()
         if proc.returncode != 0:
-            raise JobFailure(f"terraform {' '.join(args)} ล้มเหลว (exit {proc.returncode})")
+            msg = f"terraform {' '.join(args)} ล้มเหลว (exit {proc.returncode})"
+            if cred_err:
+                msg += _cred_fail_msg()
+            raise JobFailure(msg)
         return None
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    except OSError as e:
+        raise JobFailure(f"{labctl.TF_MISSING_MSG}\n(รายละเอียด: {e})") from e
     if res.returncode != 0:
-        raise JobFailure(f"terraform {' '.join(args)} ล้มเหลว:\n{res.stderr}")
+        raise JobFailure(f"terraform {' '.join(args)} ล้มเหลว:\n{res.stderr}"
+                         + _cred_suffix(res.stderr + res.stdout))
     return res.stdout if capture else None
+
+
+def _assert_state(lab):
+    """destroy ที่ไม่มี state = terraform ลบอะไรไม่ได้เลย แต่จะจบด้วย exit 0
+    แล้วเราจะไปตั้งสถานะเป็น destroyed ทั้งที่ resource ยังรัน (และยังคิดเงิน) อยู่บน AWS
+    — ต้องดักไว้ ไม่ใช่ปล่อยให้ lab หายไปจากจอเงียบ ๆ"""
+    import json
+    p = labctl.TF_STATE_DIR / lab / "terraform.tfstate"
+    n = None
+    if p.exists() and p.stat().st_size:
+        try:
+            data = json.loads(p.read_text())
+            n = sum(len(r.get("instances", [])) for r in data.get("resources", []))
+        except (ValueError, OSError):
+            n = None
+    if n:
+        return
+    raise JobFailure(
+        f"ไม่พบ state ของ '{lab}' ที่ {p} — terraform ลบอะไรไม่ได้\n"
+        "ถ้า lab นี้เคยสร้างสำเร็จ แปลว่า resource ยังอยู่บน AWS แต่หลุดจากการติดตามแล้ว\n"
+        "→ ไปลบเองใน AWS console โดยกรองด้วย tag LabName=" + lab
+        + " (Resource Groups & Tag Editor) แล้วค่อยเคลียร์ lab นี้ออกจากจอ")
+
+
+def _preflight_aws(log):
+    """ยืนยัน credential กับ STS ก่อนเริ่มงาน แล้วจำไว้ยัดให้ terraform ทุก process
+
+    ต้องทำเพราะคีย์ที่ล็อกอินผ่านหน้าเว็บอยู่ใน env ของ process เท่านั้น (restart
+    backend แล้วหาย) และ provider ไม่ได้ระบุ profile ไว้ — ถ้าไม่ยัดให้ SDK จะไล่
+    หา credential ไม่เจอแล้วไปจบที่ EC2 IMDS timeout"""
+    try:
+        creds = aws.resolve_verified()
+    except aws.AwsError as e:
+        raise JobFailure(str(e)) from e
+    # ให้ labctl.tf() ที่รันในโปรเซสนี้ (ขั้น export) เห็นคีย์ชุดเดียวกัน
+    # ส่วน subprocess terraform รับ env จาก aws.terraform_env() ใน _tfrun อีกที
+    os.environ.update(aws.credential_env(creds))
+    os.environ.pop("AWS_PROFILE", None)
+    log.write(f"AWS: {creds['arn']}\n"
+              f"     account {creds['account']} · {creds['region']} · {creds['method']}\n\n")
+    log.flush()
 
 
 def tf_outputs_for(lab):
@@ -75,7 +151,7 @@ def tf_outputs_for(lab):
 def _ensure_init(log):
     with _tf_init_lock:
         if not (TF_DIR / ".terraform").exists():
-            _tfrun(["init", "-input=false"], log=log)
+            _tfrun(labctl.tf_init_args(), log=log)
 
 
 def _ensure_workspace(lab, log):
@@ -93,16 +169,87 @@ def _set_phase(job_id, phase):
 
 def _export_lab(cfg, lab, log):
     """เรียก labctl.export_lab โดยชี้ TF_WORKSPACE ให้ tf() ภายในถูก workspace
-    และเก็บข้อความ info() ลง log — job ถูก serialize อยู่แล้วจึงแตะ environ ได้"""
+    และเก็บข้อความ info() ลง log — job ถูก serialize อยู่แล้วจึงแตะ environ ได้
+
+    คืนรายชื่อ user ที่รหัสผ่าน Windows ยังถอดไม่ได้"""
     os.environ["TF_WORKSPACE"] = lab
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            labctl.export_lab(cfg)
+            pending = labctl.export_lab(cfg)
         log.write(buf.getvalue())
         log.flush()
+        return pending or []
     finally:
         os.environ.pop("TF_WORKSPACE", None)
+
+
+# ---------------------------------------------------------------------------
+# เฝ้ารอรหัสผ่าน Windows
+#
+# AWS ปล่อยรหัสผ่าน Administrator หลัง VM บูตเสร็จ (~4-5 นาที) ซึ่งช้ากว่าที่
+# terraform apply จบมาก handout รอบแรกของ Windows lab จึงมักไม่มีรหัสผ่าน
+# เดิมต้องให้ผู้สอนมานั่งกด Refresh เอง — ตัวนี้เฝ้าให้แล้วสร้าง handout ใหม่
+# ทันทีที่ถอดรหัสได้ครบ
+# ---------------------------------------------------------------------------
+
+PW_WATCH_INTERVAL = 30
+PW_WATCH_MAX_MINUTES = 20
+
+_pw_watching = set()
+_pw_lock = threading.Lock()
+
+
+def _decrypt_pending(lab, pending):
+    """ลองถอดรหัสผ่านของ user ที่ยังค้าง — คืนรายชื่อที่ยังถอดไม่ได้"""
+    outputs = tf_outputs_for(lab)
+    if not outputs:
+        return pending
+    enc = outputs.get("windows_passwords_encrypted", {})
+    key_dir = labctl.KEYS_DIR / lab
+    still = []
+    for user in pending:
+        key_path = key_dir / f"{user}.pem"
+        if not key_path.exists() or not labctl.decrypt_windows_password(enc.get(user), key_path):
+            still.append(user)
+    return still
+
+
+def start_password_watcher(cfg, pending):
+    """เฝ้ารหัสผ่านใน thread แยก — ไม่กิน worker ของคิว job
+
+    ใช้ thread แทนการนอนรอในตัว job เพราะคิวมี worker เดียว ถ้าไป sleep ในนั้น
+    lab อื่นที่ผู้สอนสั่งต่อจะค้างรอไปด้วย
+    """
+    lab = cfg["lab_name"]
+    if not pending:
+        return
+    with _pw_lock:
+        if lab in _pw_watching:
+            return          # มีตัวเฝ้าอยู่แล้ว อย่าซ้อน
+        _pw_watching.add(lab)
+    threading.Thread(target=_pw_watch_loop, args=(cfg, list(pending)), daemon=True).start()
+
+
+def _pw_watch_loop(cfg, pending):
+    lab = cfg["lab_name"]
+    deadline = time.time() + PW_WATCH_MAX_MINUTES * 60
+    try:
+        while time.time() < deadline:
+            time.sleep(PW_WATCH_INTERVAL)
+            row = db.get_lab(lab)
+            if row and row["status"] not in ("active", "provisioning"):
+                return      # ถูกลบไประหว่างรอ — เลิกเฝ้า
+            try:
+                pending = _decrypt_pending(lab, pending)
+            except (JobFailure, ValueError, OSError):
+                continue    # อ่าน output ไม่ได้ชั่วคราว — ลองใหม่รอบหน้า
+            if not pending:
+                enqueue("export", cfg)
+                return
+    finally:
+        with _pw_lock:
+            _pw_watching.discard(lab)
 
 
 def _run_job(job_id, kind, cfg):
@@ -112,6 +259,9 @@ def _run_job(job_id, kind, cfg):
     db.update_job(job_id, state="running", started_at=time.time())
     try:
         with open(log_path, "w", encoding="utf-8") as log:
+            # เช็ค credential ก่อนแตะอะไรทั้งนั้น — ล้มตั้งแต่ก่อนสร้าง workspace
+            # ดีกว่าไปล้มตอน apply แล้วทิ้ง workspace เปล่าค้างไว้
+            _preflight_aws(log)
             varfile = labctl.build_tfvars(cfg)
             if kind == "create":
                 _set_phase(job_id, "init")
@@ -123,15 +273,29 @@ def _run_job(job_id, kind, cfg):
                 _tfrun(["apply", "-auto-approve", "-input=false",
                         f"-var-file={varfile.name}"], lab=lab, log=log)
                 _set_phase(job_id, "export")
-                _export_lab(cfg, lab, log)
+                pending = _export_lab(cfg, lab, log)
                 db.set_lab_status(lab, "active")
+                if pending:
+                    log.write(f"\n[job] เฝ้ารอรหัสผ่าน Windows ของ {', '.join(pending)} "
+                              f"— จะสร้าง handout ใหม่ให้เองเมื่อถอดได้ "
+                              f"(เช็คทุก {PW_WATCH_INTERVAL} วิ นานสุด {PW_WATCH_MAX_MINUTES} นาที)\n")
+                    start_password_watcher(cfg, pending)
+            elif kind == "export":
+                # สร้าง handout ใหม่จาก state เดิม — ไม่เรียก apply/refresh จึงไม่
+                # แตะ resource บน AWS เลย ใช้ตอนเปลี่ยน lab guide หรือแก้ title
+                _set_phase(job_id, "export")
+                _export_lab(cfg, lab, log)
             elif kind == "refresh":
                 _set_phase(job_id, "refresh")
                 _tfrun(["apply", "-refresh-only", "-auto-approve", "-input=false",
                         f"-var-file={varfile.name}"], lab=lab, log=log)
                 _set_phase(job_id, "export")
-                _export_lab(cfg, lab, log)
+                pending = _export_lab(cfg, lab, log)
+                if pending:
+                    log.write(f"\n[job] ยังเฝ้ารอรหัสผ่านของ {', '.join(pending)} ต่อให้\n")
+                    start_password_watcher(cfg, pending)
             elif kind == "destroy":
+                _assert_state(lab)
                 _set_phase(job_id, "destroy")
                 db.set_lab_status(lab, "destroying")
                 _tfrun(["destroy", "-auto-approve", "-input=false",
@@ -148,13 +312,21 @@ def _run_job(job_id, kind, cfg):
                         shutil.rmtree(d)
                 (labctl.HANDOUTS_DIR / f"{lab}-all.zip").unlink(missing_ok=True)
                 varfile.unlink(missing_ok=True)
+                # guide ที่ผู้สอนอัปโหลดไว้ให้ lab นี้ — ลบเฉพาะเมื่อสั่งมาชัดเจน
+                # เพราะเป็นเนื้อหาที่พิมพ์เอง ไม่ใช่ของที่ terraform สร้างขึ้นใหม่ได้
+                guide = cfg.get("lab_guide", "")
+                if cfg.get("_delete_guide") and labctl.is_custom_guide(guide):
+                    labctl.delete_custom_guide(guide)
+                    log.write(f"ลบ lab guide: {guide}\n")
                 db.set_lab_status(lab, "destroyed")
             log.write("\n[job] เสร็จสิ้น ✔\n")
         db.update_job(job_id, state="success", phase="done", finished_at=time.time())
     except BaseException as e:  # รวม SystemExit จาก die() ภายใน labctl
         msg = str(e) or e.__class__.__name__
         db.update_job(job_id, state="error", error=msg, finished_at=time.time())
-        if kind != "refresh":
+        # refresh/export ไม่ได้แก้อะไรบน AWS — ล้มแล้ว lab ยังใช้งานได้ตามเดิม
+        # อย่าไปปั๊ม error ทับสถานะที่ยังดีอยู่
+        if kind not in ("refresh", "export"):
             db.set_lab_status(lab, "error")
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"\n[job] ล้มเหลว: {msg}\n")
@@ -198,15 +370,10 @@ def _expiry_loop():
     while True:
         try:
             now = time.time()
-            for lab in db.list_labs():
-                if lab["status"] != "active":
-                    continue
-                exp = lab.get("expires_at")
-                if not exp or exp > now:
-                    continue
+            for lab in labctl.due_labs(db.list_labs(), now):
                 last = db.latest_job_for_lab(lab["lab_name"])
-                if last and last["kind"] == "destroy" and last["state"] in ("queued", "running"):
-                    continue  # กำลังลบอยู่แล้ว
+                if not labctl.should_attempt_destroy(last, now):
+                    continue  # กำลังลบอยู่ หรือเพิ่งล้มไป — รอ cooldown ก่อน
                 cfg = find_config_for(lab["lab_name"])
                 if not cfg:
                     continue

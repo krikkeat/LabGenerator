@@ -6,6 +6,7 @@
 import json
 import shutil
 import stat
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -143,7 +144,9 @@ class AwsLoginBody(BaseModel):
     secret_access_key: str
     session_token: Optional[str] = None
     region: Optional[str] = None
-    remember: bool = False
+    # default = จำลงดิสก์ ให้ตรงกับที่หน้าเว็บติ๊กไว้ — ถ้าไม่จำ คีย์จะอยู่แค่ใน
+    # process นี้ แล้วหายทุกครั้งที่ปิด server ทำให้ CLI มองไม่เห็นด้วย
+    remember: bool = True
 
 
 @app.post("/api/aws/login")
@@ -151,6 +154,33 @@ def api_aws_login(body: AwsLoginBody):
     try:
         return aws.login(body.access_key_id, body.secret_access_key,
                          body.session_token, body.region, body.remember)
+    except aws.AwsError as e:
+        raise HTTPException(400, str(e))
+
+
+def _known_regions():
+    """ทุก region ที่ lab ในเครื่องนี้เคยถูกสร้าง + region ปัจจุบันของ credential
+    — ตรวจแค่ region เดียวจะพลาด lab เก่าที่สร้างไว้คนละ region"""
+    regions = []
+    for lab in db.list_labs():
+        cfg = _find_config_for(lab["lab_name"]) or {}
+        r = cfg.get("region")
+        if r and r not in regions:
+            regions.append(r)
+    cur = aws.default_region() or aws.DEFAULT_REGION
+    if cur not in regions:
+        regions.append(cur)
+    return regions
+
+
+@app.get("/api/aws/orphans")
+def api_aws_orphans(lab: Optional[str] = None, region: Optional[str] = None):
+    """ถาม AWS ตรง ๆ ว่ายังมี resource ติด tag Project=hands-on-lab เหลืออยู่ไหม
+
+    ไม่พึ่ง terraform state เลย — ใช้ยืนยันหลัง destroy ล้ม หรือหลัง state หาย"""
+    try:
+        return aws.scan_tagged_resources(regions=[region] if region else _known_regions(),
+                                         lab_name=lab)
     except aws.AwsError as e:
         raise HTTPException(400, str(e))
 
@@ -171,6 +201,8 @@ def api_products():
             "instance_type": meta.get("instance_type"),
             "root_volume_gb": meta.get("root_volume_gb"),
             "params": meta.get("params", {}),
+            # หน้า wizard เอาไปบอกว่า product นี้มี guide มาตรฐานให้อยู่แล้ว
+            "lab_guide": meta.get("lab_guide"),
         })
     return {"products": out, "supported_os": labctl.SUPPORTED_OS}
 
@@ -218,6 +250,29 @@ def api_labs():
     return {"labs": labs}
 
 
+GUIDE_MAX_BYTES = 512 * 1024
+
+
+def _resolve_guide(lab_name, guide, markdown):
+    """คืน path ของ lab guide ที่จะใช้ — จากไฟล์ที่อัปโหลดมา หรือไฟล์ที่มีอยู่แล้ว
+
+    ใช้ร่วมกันระหว่างตอนสร้าง lab กับตอนเปลี่ยน guide ทีหลัง กติกาจะได้ไม่หลุดกัน
+    """
+    if markdown is not None and markdown.strip():
+        if len(markdown.encode("utf-8")) > GUIDE_MAX_BYTES:
+            raise HTTPException(400, f"ไฟล์ lab guide ใหญ่เกิน {GUIDE_MAX_BYTES // 1024} KB")
+        try:
+            return labctl.save_custom_guide(lab_name, markdown)
+        except labctl.ConfigError as e:
+            raise HTTPException(400, str(e))
+    if guide:
+        # ต้องเป็นไฟล์ที่อยู่ในรายการจริง — กัน path ที่พาไปอ่านไฟล์อื่นในเครื่อง
+        if guide not in {g["path"] for g in labctl.list_lab_guides()}:
+            raise HTTPException(400, f"ไม่รู้จัก lab guide '{guide}'")
+        return guide
+    return None
+
+
 class CreateLabBody(BaseModel):
     lab_name: str
     users: List[str]
@@ -236,6 +291,10 @@ class CreateLabBody(BaseModel):
     custom_is_windows: Optional[bool] = None
     # ชั่วโมงก่อน lab ถูกลบอัตโนมัติ — default 8, 0 = ปิด auto-expire
     ttl_hours: Optional[float] = 8
+    # hands-on lab guide ที่แนบมาตั้งแต่ตอนสร้าง — เลือกไฟล์ที่มีอยู่ (lab_guide)
+    # หรือส่งเนื้อไฟล์ที่ผู้สอนอัปโหลดมา (lab_guide_markdown)
+    lab_guide: Optional[str] = None
+    lab_guide_markdown: Optional[str] = None
 
 
 @app.post("/api/labs", status_code=202)
@@ -247,14 +306,28 @@ def api_create_lab(body: CreateLabBody):
     ttl = cfg.pop("ttl_hours", 8) or 0
     if ttl < 0 or ttl > 24 * 14:
         raise HTTPException(400, "ttl_hours ต้องอยู่ระหว่าง 0 (ปิด) ถึง 336 (14 วัน)")
+    guide_sel = cfg.pop("lab_guide", None)
+    guide_md = cfg.pop("lab_guide_markdown", None)
     if "users" not in cfg:
         cfg["users"] = []
     try:
         cfg = labctl.apply_product(labctl.validate_config(cfg))
     except labctl.ConfigError as e:
         raise HTTPException(400, str(e))
-    if not aws.resolve_credentials():
-        raise HTTPException(400, "ยังไม่ได้เชื่อมต่อ AWS — ไปที่หน้า 'เชื่อมต่อ AWS' ก่อน แล้วค่อยสร้าง lab")
+    # แนบหลัง apply_product เพื่อให้ guide ที่ผู้สอนเลือกเองชนะ guide ประจำ product
+    guide_path = _resolve_guide(cfg["lab_name"], guide_sel, guide_md)
+    if guide_path:
+        cfg["lab_guide"] = guide_path
+    # tag Expire บน resource ต้องตรงกับเวลาที่ lab จะถูกลบจริง ไม่ใช่ค่าที่พิมพ์มาเอง
+    derived_expire = labctl.expire_date_from_ttl(ttl)
+    if derived_expire:
+        cfg["expire_date"] = derived_expire
+    # ยืนยันกับ STS เลย ไม่ใช่แค่ดูว่ามีคีย์อยู่ — คีย์ที่หมดอายุจะได้ถูกปัดตกตรงนี้
+    # แทนที่จะปล่อยให้ job ไปตายตอน apply แล้วทิ้ง lab สถานะ error ไว้
+    try:
+        aws.resolve_verified()
+    except aws.AwsError as e:
+        raise HTTPException(400, str(e))
     existing = db.get_lab(cfg["lab_name"])
     if existing and existing["status"] not in ("destroyed", "error"):
         raise HTTPException(409, f"lab '{cfg['lab_name']}' มีอยู่แล้ว (สถานะ {existing['status']})")
@@ -285,6 +358,8 @@ def api_lab_detail(lab_name: str):
         "region": (cfg or {}).get("region", "ap-southeast-1"),
         "expire_date": (row or {}).get("expire_date") or (cfg or {}).get("expire_date"),
         "expires_at": (row or {}).get("expires_at"),
+        # ปุ่ม "สร้างซ้ำ" ใช้ค่านี้เติมฟอร์ม — ไม่ส่งกลับไปจะกลายเป็น default 8 ทุกครั้ง
+        "ttl_hours": (row or {}).get("ttl_hours"),
         "instance_type": (cfg or {}).get("instance_type"),
         "config": {k: v for k, v in (cfg or {}).items() if not k.startswith("_")} or None,
         "job": db.latest_job_for_lab(lab_name),
@@ -296,8 +371,11 @@ def api_lab_detail(lab_name: str):
     if status in ("active", "provisioning", "error"):
         try:
             outputs = jobs.tf_outputs_for(lab_name)
-        except jobs.JobFailure:
+        except (jobs.JobFailure, ValueError, OSError) as e:
+            # อ่าน output ไม่ได้ (terraform ยังไม่ได้ติดตั้ง / state ยังไม่มี /
+            # JSON เพี้ยน) ไม่ควรทำให้หน้า lab พังทั้งหน้า — แสดงสถานะเท่าที่มี
             outputs = None
+            info["tf_error"] = str(e)
         if outputs:
             lab_info = outputs["lab_info"]
             passwords = _passwords_for(lab_name, lab_info, outputs)
@@ -340,6 +418,125 @@ def api_job_events(job_id: str):
     )
 
 
+@app.get("/api/labs/{lab_name}/reachability")
+def api_reachability(lab_name: str, timeout: float = 3.0):
+    """เช็คว่าพอร์ต SSH/RDP ของแต่ละเครื่องเปิดรับแล้วหรือยัง
+
+    ใช้ก่อนเริ่มคลาส — รู้ก่อนว่าเครื่องไหนยังไม่พร้อม ดีกว่ารอผู้เรียนยกมือ
+    เช็คแค่ว่า TCP ต่อติดไหม ไม่ได้ล็อกอินจริง
+    """
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    detail = api_lab_detail(lab_name)
+    machines = detail.get("machines") or []
+
+    def probe(m):
+        port = 3389 if m["is_windows"] else 22
+        t0 = time.time()
+        try:
+            with socket.create_connection((m["public_ip"], port), timeout=timeout):
+                return {"user": m["user"], "port": port, "reachable": True,
+                        "ms": int((time.time() - t0) * 1000)}
+        except OSError as e:
+            return {"user": m["user"], "port": port, "reachable": False,
+                    "error": e.strerror or str(e)}
+
+    if not machines:
+        return {"checked_at": time.time(), "results": [], "ready": 0, "total": 0}
+    # ยิงพร้อมกัน — 10 เครื่องต่อกันทีละตัวด้วย timeout 3 วิ ใช้เวลาเกินครึ่งนาที
+    with ThreadPoolExecutor(max_workers=min(10, len(machines))) as ex:
+        results = list(ex.map(probe, machines))
+    return {"checked_at": time.time(), "results": results,
+            "ready": sum(1 for r in results if r["reachable"]), "total": len(results)}
+
+
+# ---------------------------------------------------------------------------
+# lab guide — แนบ/เปลี่ยน guide หลัง lab ถูกสร้างไปแล้ว
+# ---------------------------------------------------------------------------
+
+@app.get("/api/lab-guides")
+def api_lab_guides():
+    return {"guides": labctl.list_lab_guides()}
+
+
+class DeleteGuideBody(BaseModel):
+    path: str
+
+
+@app.post("/api/lab-guides/delete")
+def api_delete_guide(body: DeleteGuideBody):
+    """ลบ guide ที่อัปโหลดเอง — กันไม่ให้ลบตัวที่ lab ซึ่งยังไม่ถูก destroy ใช้อยู่"""
+    in_use = [lab["lab_name"] for lab in db.list_labs()
+              if lab["status"] != "destroyed"
+              and (json.loads(lab["config_json"]) if lab.get("config_json") else {}
+                   ).get("lab_guide") == body.path]
+    if in_use:
+        raise HTTPException(409, f"ลบไม่ได้ — ยังถูกใช้โดย lab: {', '.join(in_use)}")
+    try:
+        labctl.delete_custom_guide(body.path)
+    except labctl.ConfigError as e:
+        raise HTTPException(400, str(e))
+    return {"deleted": body.path}
+
+
+class GuideBody(BaseModel):
+    # เลือกไฟล์ที่มีอยู่แล้ว…
+    guide: Optional[str] = None
+    # …หรือวาง markdown เข้ามาตรง ๆ (จะถูกเก็บเป็น lab-guides/<lab>-custom.md)
+    markdown: Optional[str] = None
+
+
+@app.get("/api/labs/{lab_name}/guide")
+def api_get_guide(lab_name: str):
+    """guide ที่ lab นี้ใช้อยู่ + เนื้อหา (ให้หน้าเว็บเอาไปแก้ต่อได้)"""
+    cfg = _find_config_for(lab_name)
+    if cfg is None:
+        raise HTTPException(404, f"ไม่พบ config ของ lab '{lab_name}'")
+    path = cfg.get("lab_guide") or None
+    content = None
+    if path:
+        p = labctl.BASE_DIR / path
+        content = p.read_text(encoding="utf-8") if p.exists() else None
+    return {"lab_guide": path, "exists": content is not None, "content": content}
+
+
+@app.put("/api/labs/{lab_name}/guide", status_code=202)
+def api_set_guide(lab_name: str, body: GuideBody):
+    """แนบ/เปลี่ยน lab guide แล้วสร้าง handout ใหม่ — ไม่แตะ resource บน AWS"""
+    row = db.get_lab(lab_name)
+    file_cfg = _find_config_for(lab_name)
+    if not row and not file_cfg:
+        raise HTTPException(404, f"ไม่พบ lab '{lab_name}'")
+    # lab ที่สร้างจาก CLI ไม่มีแถวใน db — ถือว่า active เหมือนที่หน้า detail ทำ
+    status = row["status"] if row else "active"
+    if status != "active":
+        raise HTTPException(409, f"lab '{lab_name}' สถานะ {status} — "
+                                 "สร้าง handout ใหม่ได้เฉพาะ lab ที่ active")
+
+    guide_path = _resolve_guide(lab_name, body.guide, body.markdown)
+    if not guide_path:
+        raise HTTPException(400, "ต้องระบุ guide (ไฟล์ที่มีอยู่) หรือ markdown อย่างใดอย่างหนึ่ง")
+
+    if row and row.get("config_json"):
+        stored = json.loads(row["config_json"])
+    else:
+        stored = dict(file_cfg or {})
+    stored["lab_guide"] = guide_path
+    if row:
+        db.update_lab_config(lab_name, stored)
+    else:
+        db.upsert_lab(lab_name, stored.get("product"), "active",
+                      stored.get("expire_date"), stored)
+
+    try:
+        cfg = labctl.apply_product(labctl.validate_config(dict(stored)))
+    except labctl.ConfigError as e:
+        raise HTTPException(400, str(e))
+    job_id = jobs.enqueue("export", cfg)
+    return {"job_id": job_id, "lab_name": lab_name, "lab_guide": guide_path}
+
+
 # ---------------------------------------------------------------------------
 # refresh / destroy
 # ---------------------------------------------------------------------------
@@ -353,6 +550,8 @@ def api_refresh(lab_name: str):
 
 class DestroyBody(BaseModel):
     confirm: str
+    # ลบไฟล์ guide ที่อัปโหลดไว้ให้ lab นี้ด้วยไหม (เฉพาะ *-custom.md ของ lab นี้)
+    delete_guide: bool = False
 
 
 @app.delete("/api/labs/{lab_name}", status_code=202)
@@ -360,6 +559,8 @@ def api_destroy(lab_name: str, body: DestroyBody):
     if body.confirm != lab_name:
         raise HTTPException(400, "ต้องพิมพ์ชื่อ lab ให้ตรงเพื่อยืนยันการลบ")
     cfg = _prepared_cfg(lab_name)
+    if body.delete_guide:
+        cfg["_delete_guide"] = True  # ขึ้นต้นด้วย _ = ไม่ถูกเก็บลง config ของ lab
     job_id = jobs.enqueue("destroy", cfg)
     return {"job_id": job_id, "lab_name": lab_name}
 

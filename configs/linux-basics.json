@@ -8,6 +8,6 @@
   "allowed_cidr": "0.0.0.0/0",
   "extra_open_ports": [],
   "root_volume_gb": 20,
-  "expire_date": "2026-07-31",
+  "expire_date": "2026-12-31",
   "lab_guide": "lab-guides/linux-basics.md"
 }

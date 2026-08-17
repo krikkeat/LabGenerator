@@ -1,0 +1,10 @@
+#!/bin/bash
+# เปิด Labctl.command ใน Terminal — .app อยู่ในโฟลเดอร์ repo เสมอ
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+URL="http://127.0.0.1:8787"
+# server เปิดอยู่แล้ว → แค่เปิด browser ไม่ต้องเปิด Terminal เพิ่ม
+if curl -s -o /dev/null --max-time 2 "$URL/api/auth/status" 2>/dev/null; then
+  open "$URL"
+  exit 0
+fi
+open -a Terminal "$DIR/Labctl.command"

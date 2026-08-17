@@ -148,12 +148,12 @@ h1.page-title { font: 700 21px var(--sans); color: var(--ink); margin: 0; }
 }
 .field label .req { color: var(--crit); }
 .field label .opt { color: var(--ink-faint); text-transform: none; letter-spacing: 0; font: 400 11px var(--sans); }
-input[type="text"], input[type="password"], input[type="date"], input[type="number"], select {
+input[type="text"], input[type="password"], input[type="date"], input[type="number"], select, textarea {
   font: 500 13.5px var(--mono); color: var(--ink); background: var(--bg);
   border: 1px solid var(--border-strong); border-radius: 7px; padding: 9px 11px;
   width: 100%; outline: none; transition: border-color .15s, box-shadow .15s;
 }
-input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-tint); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-tint); }
 .help { font-size: 12px; color: var(--ink-faint); margin-top: 5px; font-family: var(--sans); }
 .help.bad { color: var(--crit); }
 .row { display: flex; gap: 14px; flex-wrap: wrap; }
@@ -163,6 +163,19 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px v
   padding: 9px 13px; font: 400 12.5px var(--sans); color: var(--crit);
   margin: 12px 0; white-space: pre-wrap; animation: fadeUp .2s ease;
 }
+/* เตือนแบบไม่ใช่ error — เช่น handout ที่ยังไม่มี lab guide */
+.warn-box {
+  background: var(--warn-tint); border: 1px solid var(--warn); border-radius: 8px;
+  padding: 9px 13px; font: 400 12.5px var(--sans); color: var(--warn);
+  margin: 12px 0; animation: fadeUp .2s ease;
+}
+/* คู่ตรงข้ามของ .err — ใช้ตอนผลตรวจออกมาว่าสะอาด */
+.ok-box {
+  background: var(--good-tint); border: 1px solid var(--good); border-radius: 8px;
+  padding: 9px 13px; font: 400 12.5px var(--sans); color: var(--good);
+  white-space: pre-wrap; animation: fadeUp .2s ease;
+}
+code { font: 400 12px var(--mono); }
 label.checkbox {
   display: flex; align-items: center; gap: 9px; font: 400 13px var(--sans);
   color: var(--ink-dim); cursor: pointer; text-transform: none; letter-spacing: 0;
