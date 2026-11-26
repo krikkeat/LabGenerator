@@ -218,6 +218,13 @@ resource "aws_instance" "lab" {
     volume_type = "gp3"
   }
 
+  # AMI มาจาก SSM "latest" ซึ่งเปลี่ยนเมื่อ AWS ออก image ใหม่ — ถ้าไม่ ignore
+  # apply ครั้งถัดไป (เช่นเพิ่มเครื่อง) จะลบเครื่องเดิมสร้างใหม่ ข้อมูลผู้เรียนหาย
+  # reset ใช้ -replace จึงยังได้ AMI ล่าสุดตามที่ตั้งใจ
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
   tags = {
     Name    = "${var.lab_name}-${each.key}"
     LabUser = each.key
