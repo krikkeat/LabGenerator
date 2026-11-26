@@ -66,6 +66,7 @@ SUPPORTED_OS = [
     "windows-2022",
     "windows-2019",
     "windows-2016",
+    "kali-linux",
 ]
 
 

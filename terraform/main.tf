@@ -3,7 +3,7 @@
 # ใช้ SSM public parameter เพื่อให้ได้ AMI ล่าสุดของแต่ละ OS เสมอ
 # ---------------------------------------------------------------------------
 locals {
-  os_catalog = {
+  os_catalog_raw = {
     "amazon-linux-2023" = {
       ssm_parameter = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
       username      = "ec2-user"
@@ -64,12 +64,25 @@ locals {
       username      = "Administrator"
       is_windows    = true
     }
+    # Kali ไม่มี SSM public parameter — หา AMI ทางการจาก AWS Marketplace ตามชื่อแทน
+    # (804fcc46 คือรหัส product ของ Kali Linux เอง ไม่ใช่ AMI ที่บุคคลที่สามทำมาขาย)
+    # ต้องกด Subscribe ฟรีใน Marketplace ครั้งแรกต่อ account ไม่งั้น RunInstances ถูกปฏิเสธ
+    "kali-linux" = {
+      ami_owner  = "aws-marketplace"
+      ami_name   = "debian-kali-last-snapshot-amd64-*-804fcc46-*"
+      username   = "kali"
+      is_windows = false
+    }
   }
+  # ทุก entry ต้องมี key ครบชุดเดียวกัน — ternary ข้างล่างเลือกระหว่าง entry กับ custom object
+  os_catalog = { for k, v in local.os_catalog_raw : k => merge({ ssm_parameter = "", ami_owner = "", ami_name = "" }, v) }
 
   # custom_ami (BYOL — เช่น Windows 10/11 ที่ import เอง) ชนะ os_catalog
   use_custom = var.custom_ami != ""
   os = local.use_custom ? {
     ssm_parameter = ""
+    ami_owner     = ""
+    ami_name      = ""
     username      = var.custom_username
     is_windows    = var.custom_is_windows
   } : local.os_catalog[var.os]
@@ -88,15 +101,33 @@ locals {
   open_ports = distinct(concat(local.base_ports, var.extra_open_ports))
 }
 
-data "aws_ssm_parameter" "ami" {
-  count = local.use_custom ? 0 : 1
-  name  = local.os.ssm_parameter
+# AMI ของทุก OS ที่ lab นี้ใช้ (OS หลัก + OS รายเครื่อง) — หนึ่ง lookup ต่อหนึ่ง OS ไม่ใช่ต่อเครื่อง
+locals {
+  used_os = toset(compact(concat([local.use_custom ? "" : var.os], values(local.user_os_name))))
 }
 
-# AMI ของ OS ที่ override รายเครื่อง — หนึ่ง lookup ต่อหนึ่ง OS ไม่ใช่ต่อเครื่อง
-data "aws_ssm_parameter" "user_ami" {
-  for_each = toset([for o in values(local.user_os_name) : o if o != ""])
-  name     = local.os_catalog[each.key].ssm_parameter
+data "aws_ssm_parameter" "os" {
+  for_each = { for o in local.used_os : o => local.os_catalog[o] if local.os_catalog[o].ssm_parameter != "" }
+  name     = each.value.ssm_parameter
+}
+
+data "aws_ami" "os" {
+  for_each    = { for o in local.used_os : o => local.os_catalog[o] if local.os_catalog[o].ami_name != "" }
+  most_recent = true
+  owners      = [each.value.ami_owner]
+  filter {
+    name   = "name"
+    values = [each.value.ami_name]
+  }
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+locals {
+  os_ami = merge({ for k, v in data.aws_ssm_parameter.os : k => v.value },
+  { for k, v in data.aws_ami.os : k => v.id })
 }
 
 data "aws_availability_zones" "available" {
@@ -190,8 +221,8 @@ resource "aws_key_pair" "user" {
 resource "aws_instance" "lab" {
   for_each = toset(var.users)
 
-  ami = (local.user_os_name[each.key] != "" ? data.aws_ssm_parameter.user_ami[local.user_os_name[each.key]].value
-  : local.use_custom ? var.custom_ami : data.aws_ssm_parameter.ami[0].value)
+  ami = (local.user_os_name[each.key] != "" ? local.os_ami[local.user_os_name[each.key]]
+  : local.use_custom ? var.custom_ami : local.os_ami[var.os])
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.lab.id]

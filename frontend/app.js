@@ -56,6 +56,7 @@ const OS_LABELS = {
   'suse-15': 'SUSE Linux Enterprise 15',
   'windows-2025': 'Windows Server 2025', 'windows-2022': 'Windows Server 2022',
   'windows-2019': 'Windows Server 2019', 'windows-2016': 'Windows Server 2016',
+  'kali-linux': 'Kali Linux',
 };
 
 // ไอคอนเส้นเดียวกันทั้งชุด (stroke 1.75) — ไม่ใช้ emoji/อักขระแทนไอคอน
@@ -598,7 +599,7 @@ function AccountPicker({ aws, onAws }) {
 
 const CUSTOM = '__custom__';
 const OS_ORDER = ['windows-2025', 'windows-2022', 'ubuntu-24.04', 'ubuntu-22.04',
-  'amazon-linux-2023', 'debian-12', 'windows-2019', 'windows-2016',
+  'amazon-linux-2023', 'debian-12', 'kali-linux', 'windows-2019', 'windows-2016',
   'amazon-linux-2', 'ubuntu-20.04', 'debian-11', 'suse-15'];
 const MAX_USERS = 50;
 const userNames = (n) => Array.from({ length: n }, (_, i) => `user${String(i + 1).padStart(2, '0')}`);
@@ -629,6 +630,7 @@ function Wizard({ aws, onAws }) {
     ttl_hours: pre?.ttl_hours != null ? String(pre.ttl_hours) : '8',
     custom_ami: pre?.custom_ami || '', custom_username: pre?.custom_username || 'Administrator',
     custom_is_windows: pre?.custom_is_windows ?? true, use_spot: !!pre?.use_spot,
+    instructorKali: !!(pre?.user_os && pre.user_os.instructor === 'kali-linux'),
   });
   const [params, setParams] = useState(pre?.product_params || {});
   const [guide, setGuide] = useState({ mode: 'none', path: '', markdown: '', pdf: '', filename: '', size: 0 });
@@ -644,7 +646,9 @@ function Wizard({ aws, onAws }) {
   const isWin = (effOS || '').startsWith('windows') || (source === 'ami' && form.custom_is_windows);
   const effType = form.instance_type || meta?.instance_type || (isWin ? 't3.medium' : 't3.small');
   const hourly = HOURLY[effType] || 0;
-  const n = form.users.length;
+  // เครื่อง instructor เป็น Kali เสมอ — แยกจากรายชื่อผู้เรียน จะได้ไม่หายตอนกดเปลี่ยนจำนวน
+  const learners = form.users.filter(u => u !== 'instructor');
+  const n = learners.length + (form.instructorKali ? 1 : 0);
   const ttlNum = parseFloat(form.ttl_hours) || 0;
   const amiOk = source !== 'ami' || (/^ami-[0-9a-f]{8,17}$/.test(form.custom_ami.trim()) && form.custom_username.trim());
   const nameOk = /^[a-z0-9-]{1,32}$/.test(form.lab_name);
@@ -652,6 +656,7 @@ function Wizard({ aws, onAws }) {
     !aws?.connected && 'ยังไม่ได้เลือก AWS account ที่ใช้งานได้',
     !nameOk && 'ชื่อ lab ใช้ได้แค่ a-z, 0-9, - (ไม่เกิน 32 ตัว)',
     n === 0 && 'ต้องมีอย่างน้อย 1 เครื่อง',
+    form.instructorKali && source === 'ami' && 'เครื่อง Instructor (Kali) ใช้คู่กับ AMI ของตัวเองไม่ได้ — เลือก OS หรือ product แทน',
     source === 'product' && !product && 'เลือก product preset',
     source === 'product' && product && !requiredOk && 'กรอกข้อมูล product ที่จำเป็นในส่วนขั้นสูง',
     !amiOk && 'ใส่ AMI ID (ami-xxxxxxxx) และ username',
@@ -663,7 +668,10 @@ function Wizard({ aws, onAws }) {
     if (problems.length) return;
     setBusy(true); setErr(null);
     const body = {
-      lab_name: form.lab_name.trim(), users: form.users, title: form.title.trim() || null,
+      lab_name: form.lab_name.trim(), title: form.title.trim() || null,
+      users: form.instructorKali ? [...learners, 'instructor'] : learners,
+      user_os: form.instructorKali && !(source === 'os' && form.os === 'kali-linux')
+        ? { instructor: 'kali-linux' } : null,
       region: form.region || null, allowed_cidr: form.allowed_cidr || null,
       ttl_hours: form.ttl_hours === '' ? 8 : parseFloat(form.ttl_hours),
       use_spot: form.use_spot || null,
@@ -727,7 +735,8 @@ function Wizard({ aws, onAws }) {
                   <button key=${o} class="os-opt ${osFamily(o)}" aria-pressed=${form.os === o}
                     onClick=${() => setForm({ ...form, os: o })}>
                     <span class="n">${OS_LABELS[o] || o}</span>
-                    <span class="m">${o.startsWith('windows') ? 'RDP · พร้อมใช้ ~5 นาที' : 'SSH · พร้อมใช้ ~2 นาที'}</span>
+                    <span class="m">${o.startsWith('windows') ? 'RDP · พร้อมใช้ ~5 นาที'
+                      : o === 'kali-linux' ? 'SSH · ต้อง Subscribe ใน Marketplace' : 'SSH · พร้อมใช้ ~2 นาที'}</span>
                   </button>`)}
               </div>`}
             ${source === 'product' && html`
@@ -754,17 +763,24 @@ function Wizard({ aws, onAws }) {
               <div>
                 <div class="flabel">จำนวนเครื่อง <span class="opt">— คนละเครื่อง</span></div>
                 <div class="stepper">
-                  <button aria-label="ลด" disabled=${n <= 1} onClick=${() => setCount(n - 1)}>−</button>
-                  <input type="number" min="1" max=${MAX_USERS} value=${n} aria-label="จำนวนเครื่อง"
+                  <button aria-label="ลด" disabled=${learners.length <= 1} onClick=${() => setCount(learners.length - 1)}>−</button>
+                  <input type="number" min="1" max=${MAX_USERS} value=${learners.length} aria-label="จำนวนเครื่อง"
                     onInput=${(e) => setCount(parseInt(e.target.value, 10))} />
-                  <button aria-label="เพิ่ม" disabled=${n >= MAX_USERS} onClick=${() => setCount(n + 1)}>+</button>
+                  <button aria-label="เพิ่ม" disabled=${learners.length >= MAX_USERS} onClick=${() => setCount(learners.length + 1)}>+</button>
                 </div>
               </div>
               <div class="tagrow" style="flex:1; min-width:200px; padding-bottom:8px">
-                ${form.users.slice(0, 8).map(u => html`<span class="tag" key=${u}>${u}</span>`)}
-                ${n > 8 && html`<span class="muted">+${n - 8}</span>`}
+                ${learners.slice(0, 8).map(u => html`<span class="tag" key=${u}>${u}</span>`)}
+                ${learners.length > 8 && html`<span class="muted">+${learners.length - 8}</span>`}
+                ${form.instructorKali && html`<span class="tag" style="background:var(--rail); color:var(--rail-ink)">instructor · Kali</span>`}
               </div>
             </div>
+            <label class="checkbox" style="margin-top:16px">
+              <input type="checkbox" checked=${form.instructorKali}
+                onChange=${(e) => setForm({ ...form, instructorKali: e.target.checked })} />
+              <span><b>เพิ่มเครื่อง Instructor (Kali Linux)</b> — ชื่อ <span class="mono">instructor</span> แยกจากเครื่องผู้เรียน
+                <br /><span class="help">ใช้ AMI ทางการของ Kali จาก AWS Marketplace — account นี้ต้องกด Subscribe (ฟรี) ครั้งแรกก่อน ไม่งั้นสร้างไม่ผ่าน</span></span>
+            </label>
           </section>
 
           <section class="form-block">
@@ -825,7 +841,8 @@ function Wizard({ aws, onAws }) {
           <div class="body">
             <div class="rows">
               <div><span class="k">Account</span><span class="v">${aws?.connected ? (aws.profile || aws.account) : '—'}</span></div>
-              <div><span class="k">เครื่อง</span><span class="v">${n} × ${machineLabel}</span></div>
+              <div><span class="k">เครื่อง</span><span class="v">${learners.length} × ${machineLabel}</span></div>
+              ${form.instructorKali && html`<div><span class="k">Instructor</span><span class="v">1 × Kali Linux</span></div>`}
               <div><span class="k">ขนาด</span><span class="v mono">${effType}</span></div>
               <div><span class="k">ลบอัตโนมัติ</span><span class="v">${ttlNum > 0 ? `${form.ttl_hours} ชม. (~$${(hourly * n * ttlNum).toFixed(2)})` : 'ปิด'}</span></div>
             </div>
@@ -1202,6 +1219,11 @@ function AddUsersModal({ labName, existing, labOs, onClose }) {
             onInput=${(e) => setNamesText(e.target.value)}
             onKeyDown=${(e) => { if (e.key === 'Enter') submit(); }} />`}
 
+        ${!existing.includes('instructor') && html`
+          <button type="button" class="btn ghost small" style="margin-top:12px"
+            onClick=${() => { setMode('names'); setNamesText('instructor'); setOs('kali-linux'); }}>
+            + เครื่อง Instructor (Kali Linux)</button>`}
+
         <div class="flabel" style="margin-top:16px">OS</div>
         <select value=${os} onChange=${(e) => setOs(e.target.value)}>
           ${!OS_LABELS[labOs] && html`<option value="">เหมือนเครื่องเดิม (custom AMI)</option>`}
@@ -1209,7 +1231,8 @@ function AddUsersModal({ labName, existing, labOs, onClose }) {
             <option value=${k}>${v}${k === labOs ? ' — เหมือนเครื่องเดิม' : ''}</option>`)}
         </select>
         ${os && OS_LABELS[labOs] && os !== labOs && html`<div class="modal-note" style="margin-top:6px">
-          ต่างจากเครื่องเดิม — สคริปต์ติดตั้งของ lab จะไม่รันบนเครื่องนี้</div>`}
+          ต่างจากเครื่องเดิม — สคริปต์ติดตั้งของ lab จะไม่รันบนเครื่องนี้${os === 'kali-linux'
+            ? ' · Kali ต้องกด Subscribe (ฟรี) ใน AWS Marketplace ครั้งแรกต่อ account' : ''}</div>`}
 
         <div class="add-preview">
           ${names.length === 0
@@ -1312,8 +1335,10 @@ function Dashboard({ labName }) {
   function cloneLab() {
     const c = lab.config || {};
     // user_os ผูกกับรายชื่อเดิม — ถ้าติดไปด้วย แก้รายชื่อใน wizard แล้วจะ validate ไม่ผ่าน
+    // ยกเว้นเครื่อง instructor (Kali) ซึ่งหน้าสร้าง lab รู้จักเป็นตัวเลือกแยก
     const { user_os, ...rest } = c;
-    PREFILL = { ...rest, lab_name: '', ttl_hours: lab.ttl_hours ?? 8 };
+    const keep = user_os && user_os.instructor ? { user_os: { instructor: user_os.instructor } } : {};
+    PREFILL = { ...rest, ...keep, lab_name: '', ttl_hours: lab.ttl_hours ?? 8 };
     nav('/new');
   }
 

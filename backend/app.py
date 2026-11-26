@@ -630,6 +630,8 @@ class CreateLabBody(BaseModel):
     lab_guide_pdf: Optional[str] = None
     # spot instance — ถูกกว่ามากแต่ถูกยึดคืนได้ เหมาะกับ lab สั้น ๆ ที่สร้างใหม่เร็ว
     use_spot: Optional[bool] = None
+    # OS รายเครื่อง เช่น {"instructor": "kali-linux"} — คนที่ไม่อยู่ใน map ใช้ OS ของ lab
+    user_os: Optional[Dict[str, str]] = None
 
 
 @app.post("/api/labs", status_code=202)

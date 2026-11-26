@@ -99,6 +99,7 @@ variable "user_os" {
     condition = alltrue([for os in values(var.user_os) : contains([
       "amazon-linux-2023", "amazon-linux-2", "ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04",
       "debian-11", "debian-12", "suse-15", "windows-2025", "windows-2022", "windows-2019", "windows-2016",
+      "kali-linux",
     ], os)])
     error_message = "user_os มี OS ที่ไม่รองรับ"
   }
