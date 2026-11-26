@@ -50,6 +50,9 @@ def _cred_suffix(text):
     return _cred_fail_msg() if any(m in text for m in _CRED_MARKERS) else ""
 
 
+_LOCAL_ONLY_COMMANDS = ("output", "workspace", "show", "state", "version")
+
+
 def _tfrun(args, lab=None, log=None, capture=False):
     """รัน terraform; lab → ส่ง TF_WORKSPACE, log → stream ทีละบรรทัดลงไฟล์"""
     exe = labctl.terraform_bin()
@@ -59,7 +62,12 @@ def _tfrun(args, lab=None, log=None, capture=False):
     try:
         env = aws.terraform_env()      # ทางเดียวกับที่ CLI ใช้ — กติกาไม่แยกกันเพี้ยน
     except aws.AwsError as e:
-        raise JobFailure(str(e)) from e
+        # output/workspace อ่านแค่ state ในเครื่อง ไม่ต้องคุยกับ AWS — SSO หมดอายุ
+        # ต้องไม่ทำให้หน้า lab มองไม่เห็นเครื่องที่ยังรันอยู่
+        if args and args[0] in _LOCAL_ONLY_COMMANDS:
+            env = dict(os.environ)
+        else:
+            raise JobFailure(str(e)) from e
     env.pop("AWS_PROFILE", None)       # คีย์ที่ยัดตรง ๆ ต้องชนะโปรไฟล์อื่น
     if lab:
         env["TF_WORKSPACE"] = lab
@@ -257,6 +265,15 @@ def _run_job(job_id, kind, cfg):
     log_path = Path(db.get_job(job_id)["log_path"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
     db.update_job(job_id, state="running", started_at=time.time())
+    if kind == "retire_account":
+        _retire_account(job_id, cfg, log_path)
+        return
+    # lab ผูกกับ account ที่สร้างมัน — ทุก terraform ใน job นี้ใช้ account นั้น
+    with aws.using_profile(cfg.get("aws_profile")):
+        _run_job_body(job_id, kind, cfg, lab, log_path)
+
+
+def _run_job_body(job_id, kind, cfg, lab, log_path):
     try:
         with open(log_path, "w", encoding="utf-8") as log:
             # เช็ค credential ก่อนแตะอะไรทั้งนั้น — ล้มตั้งแต่ก่อนสร้าง workspace
@@ -304,6 +321,16 @@ def _run_job(job_id, kind, cfg):
                 pending = _export_lab(cfg, lab, log)
                 if pending:
                     start_password_watcher(cfg, pending)
+            elif kind == "remove_user":
+                target = cfg["_remove_user"]
+                _set_phase(job_id, "destroy")
+                log.write(f"ลบเครื่องของ {target} (เครื่องคนอื่นไม่ถูกแตะ)\n")
+                _tfrun(["apply", "-auto-approve", "-input=false",
+                        f"-var-file={varfile.name}"], lab=lab, log=log)
+                _set_phase(job_id, "cleanup")
+                _remove_user_files(lab, target, log)
+                _set_phase(job_id, "export")
+                _export_lab(cfg, lab, log)
             elif kind == "export":
                 # สร้าง handout ใหม่จาก state เดิม — ไม่เรียก apply/refresh จึงไม่
                 # แตะ resource บน AWS เลย ใช้ตอนเปลี่ยน lab guide หรือแก้ title
@@ -351,10 +378,27 @@ def _run_job(job_id, kind, cfg):
         # refresh/export ไม่ได้แก้อะไรบน AWS — ล้มแล้ว lab ยังใช้งานได้ตามเดิม
         # อย่าไปปั๊ม error ทับสถานะที่ยังดีอยู่
         # add_users ล้มก็ไม่กระทบเครื่องเดิม — lab ยังใช้ต่อได้
-        if kind not in ("refresh", "export", "add_users"):
+        if kind not in ("refresh", "export", "add_users", "remove_user"):
             db.set_lab_status(lab, "error")
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"\n[job] ล้มเหลว: {msg}\n")
+
+
+def _remove_user_files(lab, user, log):
+    """ลบ key + handout ของผู้เรียนที่ถูกเอาออก — เครื่องไม่อยู่แล้ว ไฟล์ก็ชี้ไปที่ IP ที่ไม่มีอยู่"""
+    import shutil
+    targets = [labctl.KEYS_DIR / lab / f"{user}.pem",
+               labctl.HANDOUTS_DIR / lab / user,
+               labctl.HANDOUTS_DIR / lab / f"{lab}-{user}.zip"]
+    for t in targets:
+        if t.is_dir():
+            shutil.rmtree(t)
+        elif t.exists():
+            t.unlink()
+        else:
+            continue
+        log.write(f"ลบ {t.relative_to(labctl.BASE_DIR) if t.is_relative_to(labctl.BASE_DIR) else t}\n")
+    (labctl.HANDOUTS_DIR / f"{lab}-all.zip").unlink(missing_ok=True)
 
 
 def find_config_for(lab_name):
@@ -477,3 +521,39 @@ def sse_events(job_id):
             yield f"event: done\ndata: {_json.dumps({'state': job['state'], 'error': job['error']})}\n\n"
             return
         time.sleep(0.7)
+
+
+def _retire_account(job_id, cfg, log_path):
+    """ขั้นสุดท้ายของการลบ account: รันหลัง destroy ทุกตัว (คิว serial) — ถ้ายังมี lab
+    ค้างอยู่ใน account นี้ ห้ามลบโปรไฟล์ เพราะจะไม่เหลือทางลบ lab นั้นอีก"""
+    import json as _json
+    from . import accounts
+    profile = cfg["_profile"]
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            left = [r["lab_name"] for r in db.list_labs()
+                    if r["status"] != "destroyed"
+                    and _json.loads(r.get("config_json") or "{}").get("aws_profile") == profile]
+            if left:
+                raise JobFailure(f"ยังมี lab ใน {profile} ที่ลบไม่สำเร็จ: {', '.join(left)} — "
+                                 "ไม่ลบ account เพื่อให้ยังกลับไปลบ lab เหล่านั้นได้")
+            session = accounts.profile_session(profile)
+            if cfg.get("_sign_out") and session:
+                others = [p["name"] for p in accounts.list_profiles()
+                          if p["name"] != profile and accounts.profile_session(p["name"]) == session]
+                if others:
+                    log.write(f"ไม่ sign out SSO {session} — ยังมี account อื่นใช้อยู่: {', '.join(others)}\n")
+                else:
+                    revoked = accounts.sso_logout(session)
+                    log.write(f"sign out SSO {session}: "
+                              f"{'เพิกถอน token กับ AWS แล้ว' if revoked else 'token หมดอายุอยู่แล้ว — ลบ cache'}\n")
+            accounts.remove_profile(profile)
+            log.write(f"ลบโปรไฟล์ {profile} ออกจาก ~/.aws แล้ว (สำรองไว้ที่ ~/.aws/*.labctl-bak)\n")
+            aws.reset_caches()
+            log.write("\n[job] เสร็จสิ้น ✔\n")
+        db.update_job(job_id, state="success", phase="done", finished_at=time.time())
+    except BaseException as e:
+        msg = str(e) or e.__class__.__name__
+        db.update_job(job_id, state="error", error=msg, finished_at=time.time())
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"\n[job] ล้มเหลว: {msg}\n")

@@ -21,6 +21,10 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
+import contextvars
+import contextlib
+
+from . import accounts
 
 AWS_DIR = Path.home() / ".aws"
 PROFILE = "labctl"
@@ -158,6 +162,34 @@ def _read_profiles():
     return cp
 
 
+# โปรไฟล์ที่ job กำลังใช้ — lab ผูกกับ account ที่สร้างมัน ลบ/แก้ต้องใช้ account เดิม
+# แม้ผู้ใช้จะสลับไปใช้ account อื่นบนหน้าเว็บแล้ว
+_forced_profile = contextvars.ContextVar("labctl_forced_profile", default=None)
+
+
+@contextlib.contextmanager
+def using_profile(name):
+    """ให้ทุกการเรียก credential ใน block นี้ใช้โปรไฟล์ name (None = ตามที่เลือกไว้)"""
+    token = _forced_profile.set(name or None)
+    try:
+        yield
+    finally:
+        _forced_profile.reset(token)
+
+
+def selected_profile():
+    """โปรไฟล์ที่ใช้อยู่: ของ job ก่อน แล้วค่อยเป็น account ที่เลือกไว้บนหน้าเว็บ"""
+    return _forced_profile.get() or accounts.active_profile()
+
+
+def _account_candidate(name):
+    try:
+        creds, _exp = accounts.credentials(name)
+    except accounts.AccountError as e:
+        raise AwsError(str(e), code="NeedsLogin" if e.needs_login else "AccountError") from e
+    return (f"account:{name}", creds["access_key"], creds["secret_key"], creds["session_token"])
+
+
 def credential_candidates():
     """credential ทุกแหล่งที่หาเจอ เรียงลำดับเดียวกับที่ terraform ใช้:
     env → AWS_PROFILE → default → labctl
@@ -165,6 +197,11 @@ def credential_candidates():
     คืนมาทั้งหมดแทนที่จะคืนตัวแรก เพราะคีย์ที่ค้างอยู่ใน env ของ process อาจ
     หมดอายุไปแล้วในขณะที่โปรไฟล์บนดิสก์เพิ่งถูกอัปเดต — resolve_verified()
     จะได้ข้ามตัวที่ใช้ไม่ได้ไปหยิบตัวถัดไปเอง"""
+    # เลือก account ไว้แล้ว = ใช้ตัวนั้นตัวเดียว ไม่ไหลไปหยิบ account อื่นเงียบ ๆ
+    # (สร้าง lab ผิด account คือเงินออกผิดที่)
+    profile = selected_profile()
+    if profile:
+        return [_account_candidate(profile)]
     out = []
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         out.append(("env", os.environ["AWS_ACCESS_KEY_ID"],
@@ -193,6 +230,15 @@ def credential_candidates():
     return out
 
 
+def reset_caches():
+    """เรียกหลังสลับ/เพิ่ม account — ให้ status และ terraform ใช้ account ใหม่ทันที"""
+    global _env_cache
+    with _lock:
+        _cache["t"] = 0.0
+        _cache["res"] = None
+    _env_cache = {"t": 0.0, "env": None}
+
+
 def resolve_credentials():
     """คืน (method, key, secret, token) ตัวแรกที่หาเจอ หรือ None — เช็คแค่ว่า
     'มี credential อยู่ไหม' ไม่ได้ยืนยันกับ AWS ว่ายังใช้ได้"""
@@ -213,6 +259,7 @@ def resolve_verified(timeout=12):
     cands = credential_candidates()
     if not cands:
         raise AwsError("ยังไม่ได้เชื่อมต่อ AWS — ไม่พบ credential ในเครื่อง\n" + RELOGIN_HINT)
+    profile = selected_profile()
     # รวมแหล่งที่พังด้วยเหตุผลเดียวกันเข้าบรรทัดเดียว — ปกติ env กับ profile คือ
     # คีย์ชุดเดียวกัน ข้อความจะซ้ำกันเป๊ะ ไม่มีประโยชน์ที่จะโชว์สองรอบ
     problems = {}
@@ -223,7 +270,8 @@ def resolve_verified(timeout=12):
             problems.setdefault(str(e), []).append(method)
             continue
         return {"method": method, "access_key": key, "secret_key": secret,
-                "session_token": token, "region": default_region() or DEFAULT_REGION,
+                "session_token": token, "profile": profile,
+                "region": default_region() or DEFAULT_REGION,
                 "account": ident["account"], "arn": ident["arn"]}
     detail = "\n".join(f"  · {', '.join(ms)}: {msg}" for msg, ms in problems.items())
     raise AwsError("credential ที่มีอยู่ใช้ไม่ได้:\n" + detail + "\n" + RELOGIN_HINT)
@@ -257,8 +305,10 @@ def terraform_env(base=None, ttl=300, timeout=12):
     """
     global _env_cache
     now = time.time()
-    if not _env_cache["env"] or now - _env_cache["t"] > ttl:
-        _env_cache = {"t": now, "env": credential_env(resolve_verified(timeout=timeout))}
+    key = selected_profile()
+    if not _env_cache["env"] or now - _env_cache["t"] > ttl or _env_cache.get("key") != key:
+        _env_cache = {"t": now, "key": key,
+                      "env": credential_env(resolve_verified(timeout=timeout))}
     env = dict(os.environ if base is None else base)
     env.update(_env_cache["env"])
     return env
@@ -314,6 +364,14 @@ def ttl_outlives_credentials(ttl_hours):
 
 
 def default_region():
+    profile = selected_profile()
+    if profile:
+        try:
+            region = accounts.get_profile(profile).get("region")
+        except accounts.AccountError:
+            region = None
+        if region:
+            return region
     for var in ("AWS_REGION", "AWS_DEFAULT_REGION"):
         if os.environ.get(var):
             return os.environ[var]
@@ -337,18 +395,29 @@ def status(force=False):
     with _lock:
         if not force and _cache["res"] and time.time() - _cache["t"] < 60:
             return _cache["res"]
-        creds = resolve_credentials()
-        if not creds:
+        profile = selected_profile()
+        try:
+            creds = resolve_credentials()
+        except AwsError as e:
+            creds = None
+            res = {"connected": False, "profile": profile, "reason": str(e),
+                   "needs_login": e.code == "NeedsLogin"}
+        if creds is None and profile is None:
             res = {"connected": False, "reason": "ยังไม่มี credential ในเครื่อง"}
-        else:
+        elif creds is not None:
             method, key, secret, token = creds
+            # ยังไม่เคยเลือก account แต่ใช้โปรไฟล์บนดิสก์อยู่ = บอกชื่อโปรไฟล์นั้น หน้าเว็บจะได้เลือกให้ถูก
+            if profile is None and method.startswith("profile:"):
+                profile = method.split(":", 1)[1]
             try:
                 ident = sts_get_caller_identity(key, secret, token)
-                res = {"connected": True, "method": method,
+                res = {"connected": True, "method": method, "profile": profile,
                        "account": ident["account"], "arn": ident["arn"],
                        "region": default_region() or DEFAULT_REGION}
             except AwsError as e:
-                res = {"connected": False, "method": method, "reason": str(e)}
+                res = {"connected": False, "method": method, "profile": profile,
+                       "reason": str(e),
+                       "needs_login": bool(profile) and e.code in ("ExpiredToken", "ExpiredTokenException")}
         _cache["t"] = time.time()
         _cache["res"] = res
         return res
@@ -377,6 +446,8 @@ def login(access_key, secret_key, session_token=None, region=None, remember=True
 
     if remember:
         _write_profile(access_key, secret_key, session_token, region)
+        accounts.forget_cached(PROFILE)
+        accounts.set_active(PROFILE)
     _write_cred_meta(temporary=bool(session_token),
                      method="profile:" + PROFILE if remember else "env")
 

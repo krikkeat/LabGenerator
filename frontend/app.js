@@ -20,6 +20,7 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) {
     let msg = `${res.status}`;
+    let needsLogin = false;
     try {
       const d = (await res.json()).detail;
       if (typeof d === 'string') msg = d;
@@ -28,9 +29,15 @@ async function api(path, opts = {}) {
       else if (Array.isArray(d)) {
         msg = `ข้อมูลที่ส่งไม่ถูกต้อง (${res.status}): ` + d.map(x =>
           `${(x.loc || []).filter(k => k !== 'body').join('.') || 'request'} — ${x.msg}`).join(' · ');
-      } else if (d) msg = JSON.stringify(d);
+      } else if (d && typeof d === 'object') {
+        msg = d.message || JSON.stringify(d);
+        needsLogin = !!d.needs_login;
+      }
     } catch (e) { /* noop */ }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    err.needsLogin = needsLogin;
+    throw err;
   }
   return res.json();
 }
@@ -51,18 +58,52 @@ const OS_LABELS = {
   'windows-2019': 'Windows Server 2019', 'windows-2016': 'Windows Server 2016',
 };
 
-const STATUS_LABEL = {
-  active: 'ACTIVE', provisioning: 'PROVISIONING', queued: 'QUEUED',
-  destroying: 'DESTROYING', destroyed: 'DESTROYED', error: 'ERROR',
+// ไอคอนเส้นเดียวกันทั้งชุด (stroke 1.75) — ไม่ใช้ emoji/อักขระแทนไอคอน
+const ICON_PATHS = {
+  labs: 'M4 5h16v4H4zM4 11h16v4H4zM4 17h10v2H4z',
+  plus: 'M12 5v14M5 12h14',
+  cloud: 'M7 18h10a4 4 0 0 0 .6-7.96A6 6 0 0 0 6.2 9.1 4.5 4.5 0 0 0 7 18z',
+  sun: 'M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z',
+  moon: 'M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z',
+  logout: 'M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l4-4-4-4M14 12H4',
+  download: 'M12 4v11M7 10l5 5 5-5M5 20h14',
+  refresh: 'M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6',
+  copy: 'M9 9h10v10H9zM5 15V5h10',
+  check: 'M5 12.5l4.5 4.5L19 7',
+  arrow: 'M5 12h14M13 6l6 6-6 6',
 };
-
-function fmtExpire(expiresAt) {
-  if (!expiresAt) return null;
-  const ms = expiresAt * 1000 - Date.now();
-  if (ms <= 0) return 'กำลังจะถูกลบ';
-  const hh = Math.floor(ms / 3600000), mm = Math.round((ms % 3600000) / 60000);
-  return hh > 0 ? `⏳ ${hh} ชม ${mm} นาที` : `⏳ ${mm} นาที`;
+function Icon({ name }) {
+  return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d=${ICON_PATHS[name]} /></svg>`;
 }
+
+const osFamily = (os, isWindows) =>
+  (isWindows ?? (os || '').startsWith('windows')) ? 'win'
+    : (!os || os.startsWith('custom')) ? 'custom' : 'linux';
+
+// แถบเวลา — ความยาวคือสัดส่วนเวลาที่เหลือของ TTL ทั้งหมด
+function TimeBar({ expiresAt, ttlHours }) {
+  if (!expiresAt) return html`<div class="timebar"><span class="lbl">ไม่ลบอัตโนมัติ</span></div>`;
+  const left = expiresAt * 1000 - Date.now();
+  const total = Math.max((ttlHours || 0) * 3600000, left, 1);
+  const pct = Math.max(0, Math.min(100, (left / total) * 100));
+  const cls = left <= 0 ? 'late' : left < 30 * 60000 ? 'soon' : '';
+  return html`
+    <div class="timebar ${cls}" role="img" aria-label=${`เหลือ ${fmtLeft(left)}`}>
+      <div class="track"><div class="fill" style=${`width:${pct}%`}></div></div>
+      <span class="lbl">${left <= 0 ? 'กำลังลบ' : fmtLeft(left)}</span>
+    </div>`;
+}
+function fmtLeft(ms) {
+  if (ms <= 0) return '0 นาที';
+  const hh = Math.floor(ms / 3600000), mm = Math.round((ms % 3600000) / 60000);
+  return hh > 0 ? `${hh} ชม. ${mm} นาที` : `${mm} นาที`;
+}
+
+const STATUS_LABEL = {
+  active: 'พร้อมใช้', provisioning: 'กำลังสร้าง', queued: 'รอคิว',
+  destroying: 'กำลังลบ', destroyed: 'ลบแล้ว', error: 'ผิดพลาด',
+};
 
 function useRoute() {
   const [route, setRoute] = useState(location.hash.slice(1) || '/');
@@ -90,22 +131,30 @@ function ErrBox({ err }) {
 // login / first-time setup
 // ---------------------------------------------------------------------------
 
+function DemoBadge({ name, os, ip, proto, fam }) {
+  return html`
+    <div class="badge ${fam}" aria-hidden="true" style="min-height:0">
+      <div class="band"><span>${os}</span><span class="proto">${proto}</span></div>
+      <div class="who" style="padding-bottom:12px"><div class="name" style="font-size:19px">${name}</div>
+        <div class="status-line" style="font-size:12px">● พร้อมใช้ · <span class="mono">${ip}</span></div></div>
+    </div>`;
+}
+
 function BrandPanel() {
   return html`
-    <div class="login-brand">
+    <aside class="login-brand">
       <div class="logo-row">
         <div class="logo">lc</div>
-        <div><div style="font:700 16px var(--mono)">labctl</div>
-        <div style="font:500 10.5px var(--sans); opacity:.75">Hands-on Lab Generator</div></div>
+        <div><div class="brand-name">labctl</div><div class="brand-sub">PoC & hands-on lab บน AWS</div></div>
       </div>
-      <div class="headline">สร้าง lab environment บน AWS สำหรับ training — อัตโนมัติทั้งระบบ</div>
-      <div class="points">
-        <div><span class="n">01</span><span>VM แยกหนึ่งเครื่องต่อผู้เรียนหนึ่งคน พร้อม key ของตัวเอง</span></div>
-        <div><span class="n">02</span><span>handout + lab guide สร้างให้อัตโนมัติ พร้อม zip ส่งผู้เรียน</span></div>
-        <div><span class="n">03</span><span>จบ training ลบทิ้งทั้งหมดในคำสั่งเดียว — ไม่มีอะไรค้างคิดเงิน</span></div>
+      <div class="headline">เครื่องหนึ่งเครื่องต่อหนึ่งคน พร้อมไฟล์เข้าเครื่อง ภายในไม่กี่นาที</div>
+      <div class="lede">สร้าง VM บน AWS แยก VPC ต่อ lab ส่ง handout ให้แต่ละคน แล้วลบทิ้งหมดเมื่อจบ — ไม่มีอะไรค้างคิดเงิน</div>
+      <div class="demo-badges">
+        <${DemoBadge} name="user01" os="Windows Server 2025" proto="RDP · 3389" ip="54.169.169.237" fam="win" />
+        <${DemoBadge} name="user02" os="Ubuntu 24.04 LTS" proto="SSH · 22" ip="13.212.40.18" fam="linux" />
       </div>
-      <div class="foot">v2.0 · terraform + aws · local only</div>
-    </div>`;
+      <div class="foot">ตัวอย่างบัตร · รันบนเครื่องนี้เท่านั้น (127.0.0.1)</div>
+    </aside>`;
 }
 
 function PwInput({ value, onInput, onKeyDown, placeholder, show, onToggle }) {
@@ -145,10 +194,9 @@ function SetupScreen({ onDone }) {
 
   return html`
     <div class="login-wrap">
-      <div class="login-card">
-        <${BrandPanel} />
-        <div class="login-form">
-          <div style="font:700 20px var(--sans)">ตั้งค่าครั้งแรก</div>
+      <${BrandPanel} />
+      <main class="login-form">
+          <h1>ตั้งค่าครั้งแรก</h1>
           <div class="page-sub" style="margin:4px 0 26px">ยังไม่มีบัญชีผู้ดูแลในเครื่องนี้ — สร้างบัญชีก่อนเริ่มใช้งาน</div>
           <div class="field"><label>Username</label>
             <input type="text" value=${f.u} onInput=${(e) => setF({ ...f, u: e.target.value, err: '' })}
@@ -165,9 +213,8 @@ function SetupScreen({ onDone }) {
           <div class="help" style="margin-bottom:16px">เก็บเป็น hash ในเครื่องนี้เท่านั้น — ไม่ถูกส่งออกไปไหน</div>
           <${ErrBox} err=${f.err} />
           <button class="btn primary block" disabled=${!canGo} onClick=${doCreate}>
-            ${f.busy ? 'กำลังสร้างบัญชี…' : 'สร้างบัญชีและเข้าสู่ระบบ →'}</button>
-        </div>
-      </div>
+            ${f.busy ? 'กำลังสร้างบัญชี…' : 'สร้างบัญชีและเข้าสู่ระบบ'}</button>
+      </main>
     </div>`;
 }
 
@@ -191,14 +238,13 @@ function LoginScreen({ onAuthed, prefillU }) {
 
   return html`
     <div class="login-wrap">
-      <div class="login-card">
-        <${BrandPanel} />
-        <div class="login-form">
-          <div style="font:700 20px var(--sans)">เข้าสู่ระบบ</div>
-          <div class="page-sub" style="margin:4px 0 26px">สำหรับผู้สอน/ผู้ดูแล — ระบบรันบนเครื่องของคุณเท่านั้น (127.0.0.1)</div>
+      <${BrandPanel} />
+      <main class="login-form">
+          <h1>เข้าสู่ระบบ</h1>
+          <div class="page-sub" style="margin:4px 0 26px">บัญชีของ labctl ในเครื่องนี้ — เข้าแล้วสร้างเครื่องได้เลย</div>
           <div class="field"><label>Username</label>
             <input type="text" value=${f.u} onInput=${(e) => setF({ ...f, u: e.target.value, err: false })}
-              placeholder="instructor" autocomplete="off" /></div>
+              placeholder="username" autocomplete="username" /></div>
           <div class="field" style="margin-bottom:8px"><label>Password</label>
             <${PwInput} value=${f.p} show=${f.show} placeholder="••••••••"
               onInput=${(e) => setF({ ...f, p: e.target.value, err: false })}
@@ -211,11 +257,10 @@ function LoginScreen({ onAuthed, prefillU }) {
             จำไว้ในเครื่องนี้ — ปิดโปรแกรมแล้วไม่ต้องเข้าสู่ระบบใหม่
           </label>
           <button class="btn primary block" disabled=${!canGo} onClick=${doLogin}>
-            ${f.busy ? 'กำลังตรวจสอบ…' : 'เข้าสู่ระบบ →'}</button>
+            ${f.busy ? 'กำลังตรวจสอบ…' : 'เข้าสู่ระบบ'}</button>
           <div class="help" style="margin-top:18px; text-align:center">
             credential ถูกตรวจกับเครื่องนี้เท่านั้น — ไม่ถูกส่งออกนอกเครื่องและไม่ลง log</div>
-        </div>
-      </div>
+      </main>
     </div>`;
 }
 
@@ -223,42 +268,51 @@ function LoginScreen({ onAuthed, prefillU }) {
 // shell (sidebar + main)
 // ---------------------------------------------------------------------------
 
+function AccountChip({ aws }) {
+  const state = aws === null ? 'wait' : aws.connected ? 'ok' : aws.needs_login ? 'login' : 'bad';
+  const label = { wait: 'กำลังเช็ค…', ok: 'ใช้งานได้', login: 'ต้อง sign in', bad: 'ยังไม่เชื่อมต่อ' }[state];
+  return html`
+    <button class="acct-chip ${state}" onClick=${() => nav('/aws')}
+      title="AWS account ที่ใช้สร้าง lab ใหม่ — กดเพื่อสลับหรือเพิ่ม">
+      <div class="top"><${Icon} name="cloud" />
+        <span class="name">${aws?.profile || (aws?.connected ? 'AWS' : 'AWS account')}</span>
+        <span class="state">${label}</span></div>
+      <div class="sub">${aws?.connected ? `${aws.account} · ${aws.region}` : 'กดเพื่อเลือก account'}</div>
+    </button>`;
+}
+
 function Sidebar({ route, labs, aws, theme, onToggleTheme, onLogout }) {
-  const activeCount = labs.filter(l => l.status === 'active').length;
+  const activeCount = labs.filter(l => l.status !== 'destroyed').length;
   const items = [
-    { icon: '▤', label: 'Labs ของคุณ', badge: activeCount, r: '/', match: (rt) => rt === '/' || rt.startsWith('/lab/') || rt.startsWith('/job/') },
-    { icon: '＋', label: 'สร้าง lab ใหม่', badge: 0, r: '/new', match: (rt) => rt === '/new' },
-    { icon: '⚙', label: 'การเชื่อมต่อ AWS', badge: 0, r: '/aws', match: (rt) => rt === '/aws' },
+    { icon: 'labs', label: 'Labs', count: activeCount, r: '/', match: (rt) => rt === '/' || rt.startsWith('/lab/') || rt.startsWith('/job/') },
+    { icon: 'plus', label: 'สร้าง lab', count: 0, r: '/new', match: (rt) => rt === '/new' },
+    { icon: 'cloud', label: 'AWS accounts', count: 0, r: '/aws', match: (rt) => rt === '/aws' },
   ];
   return html`
-    <div class="sidebar">
-      <div class="logo-row" onClick=${() => nav('/')}>
+    <nav class="sidebar" aria-label="เมนูหลัก">
+      <button class="logo-row" onClick=${() => nav('/')}>
         <div class="logo">lc</div>
-        <div><div class="brand-name">labctl</div><div class="brand-sub">Hands-on Lab Generator</div></div>
-      </div>
-      <nav class="nav">
+        <div class="brand-text"><div class="brand-name">labctl</div><div class="brand-sub">PoC & hands-on lab</div></div>
+      </button>
+      <div class="nav">
         ${items.map(n => html`
-          <button key=${n.r} class="nav-item ${n.match(route) ? 'active' : ''}" onClick=${() => nav(n.r)}>
-            <span class="icon">${n.icon}</span><span>${n.label}</span>
-            ${n.badge > 0 && html`<span class="badge">${n.badge}</span>`}
+          <button key=${n.r} class="nav-item ${n.match(route) ? 'active' : ''}"
+            aria-current=${n.match(route) ? 'page' : null} onClick=${() => nav(n.r)}>
+            <${Icon} name=${n.icon} /><span class="label">${n.label}</span>
+            ${n.count > 0 && html`<span class="count">${n.count}</span>`}
           </button>`)}
-      </nav>
-      <div class="aws-card ${aws?.connected ? 'on' : ''}" onClick=${() => nav('/aws')}>
-        <div class="line1"><span class="dot"></span>
-          ${aws === null ? 'กำลังเช็ค AWS…' : aws.connected ? 'เชื่อมต่อ AWS แล้ว' : 'ยังไม่เชื่อมต่อ AWS'}</div>
-        ${aws?.connected && html`<div class="line2">${aws.account} · ${aws.region}</div>`}
       </div>
+      <${AccountChip} aws=${aws} />
       <div class="side-foot">
-        <span>${theme === 'light' ? '☀ Light' : '☾ Dark'}</span>
-        <button class="theme-toggle ${theme === 'dark' ? 'dark' : ''}" onClick=${onToggleTheme}
-          aria-label="สลับธีม"><span class="knob"></span></button>
-        <button class="logout-link" onClick=${onLogout}>ออกจากระบบ</button>
+        <button class="icon-btn" onClick=${onToggleTheme} aria-label="สลับธีม">
+          <${Icon} name=${theme === 'dark' ? 'sun' : 'moon'} /><span>${theme === 'dark' ? 'Light' : 'Dark'}</span></button>
+        <button class="icon-btn" onClick=${onLogout}><${Icon} name="logout" /><span>ออกจากระบบ</span></button>
       </div>
-    </div>`;
+    </nav>`;
 }
 
 // ---------------------------------------------------------------------------
-// home — lab cards
+// home — labs
 // ---------------------------------------------------------------------------
 
 function labCost(l) {
@@ -276,68 +330,80 @@ function Home({ labs, loaded }) {
     try {
       const d = await api(`/labs/${l.lab_name}`);
       PREFILL = d.config;
-      nav('/new');
-    } catch (e) { /* ไม่มี config — เข้า wizard เปล่า */ PREFILL = null; nav('/new'); }
+    } catch (e) { PREFILL = null; }       // ไม่มี config — เริ่มฟอร์มเปล่า
+    nav('/new');
   }
 
   function open(l) {
     if (['provisioning', 'queued', 'destroying'].includes(l.status) && l.job) {
       nav(`/job/${l.job.id}?lab=${l.lab_name}`);
     } else if (l.status === 'error' && l.job && l.job.kind !== 'destroy') {
-      // destroy ที่ล้มเหลวต้องพาไปหน้า dashboard ไม่ใช่หน้า log — ไม่งั้นผู้ใช้
-      // ไปกด Destroy ซ้ำไม่ได้เลย (log ยังกดดูได้จากปุ่มในหน้านั้น)
+      // destroy ที่ล้มต้องพาไป dashboard — ไม่งั้นกด Destroy ซ้ำไม่ได้
       nav(`/job/${l.job.id}?lab=${l.lab_name}`);
     } else {
       nav(`/lab/${l.lab_name}`);
     }
   }
 
+  const goNew = () => { PREFILL = null; nav('/new'); };
+
   return html`
     <div class="screen">
-      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px">
+      <div class="page-head">
         <div>
-          <h1 class="page-title">Labs ของคุณ</h1>
-          <div class="page-sub">${active.length} active · ${vmCount} VM กำลังรัน · ~$${liveCost.toFixed(2)}/ชม.</div>
+          <h1 class="page-title">Labs</h1>
+          <div class="page-sub">อัปเดตเองทุก 8 วินาที</div>
         </div>
-        <button class="btn primary" onClick=${() => { PREFILL = null; nav('/new'); }}>＋ สร้าง lab ใหม่</button>
+        <button class="btn primary" onClick=${goNew}><${Icon} name="plus" />สร้าง lab</button>
       </div>
-      <div class="live-note">● live · อัปเดตอัตโนมัติทุก 8 วินาที</div>
+      ${shown.length > 0 && html`
+        <div class="summary-strip">
+          <span><b>${active.length}</b>lab พร้อมใช้</span>
+          <span><b>${vmCount}</b>เครื่องกำลังรัน</span>
+          ${liveCost > 0 && html`<span><b>$${liveCost.toFixed(2)}</b>ต่อชั่วโมงตอนนี้</span>`}
+        </div>`}
       <div class="lab-list">
         ${!loaded && html`<div class="empty">กำลังโหลด…</div>`}
-        ${loaded && shown.length === 0 && destroyed.length === 0
-          && html`<div class="empty">ยังไม่มี lab — กด "สร้าง lab ใหม่" เพื่อเริ่ม</div>`}
+        ${loaded && shown.length === 0 && html`
+          <div class="empty-desk">
+            <h2>ยังไม่มี lab ที่รันอยู่</h2>
+            <p>เลือก AWS account, OS และจำนวนเครื่อง แล้วกดสร้าง — ได้ VM พร้อมไฟล์เข้าเครื่องของแต่ละคน</p>
+            <button class="btn primary" onClick=${goNew}><${Icon} name="plus" />สร้าง lab แรก</button>
+          </div>`}
         ${shown.map(l => {
           const busy = ['provisioning', 'queued', 'destroying'].includes(l.status);
-          const iconCls = l.status === 'error' ? 'crit' : busy ? 'warn' : '';
-          const initials = l.lab_name.slice(0, 2).toUpperCase();
-          const subBits = [l.product_name || 'Custom OS', OS_LABELS[l.os] || l.os,
-            l.instance_type, `${l.users} ผู้เรียน`].filter(Boolean);
+          const subBits = [OS_LABELS[l.os] || l.os || 'custom AMI', `${l.users} เครื่อง`,
+            l.instance_type, l.aws_profile].filter(Boolean);
+          const busyText = l.job?.kind === 'destroy' ? 'กำลังลบ resource บน AWS…'
+            : l.job?.kind === 'remove_user' ? 'กำลังลบเครื่องบน AWS…' : 'กำลังสร้างเครื่องบน AWS…';
           return html`
           <button key=${l.lab_name} class="lab-card ${l.status === 'error' ? 'error' : ''}" onClick=${() => open(l)}>
-            <div class="lab-icon ${iconCls}">${initials}</div>
+            <span class="band ${osFamily(l.os)}"></span>
             <div class="lab-main">
               <div class="lab-title-row">
-                <span class="lab-name">${l.lab_name}</span>
+                <span class="lab-name">${l.title || l.lab_name}</span>
                 <${Pill} status=${l.status} />
               </div>
               ${l.status === 'error'
-                ? html`<div class="lab-sub bad">${l.job?.error || 'งานล้มเหลว'} · กดเปิดเพื่อดู log</div>`
+                ? html`<div class="lab-sub bad">${l.job?.error || 'งานล้มเหลว'} — เปิดเพื่อดู log</div>`
                 : busy
-                  ? html`<div class="lab-sub">${l.job?.kind === 'destroy' ? 'กำลังลบ resource บน AWS…' : 'กำลังสร้างเครื่องบน AWS…'} กดเพื่อดู log สด</div>`
-                  : html`<div class="lab-sub">${subBits.join(' · ')}</div>`}
+                  ? html`<div class="lab-sub">${busyText} เปิดเพื่อดู log สด</div>`
+                  : html`<div class="lab-sub"><span class="mono">${l.lab_name}</span> · ${subBits.join(' · ')}</div>`}
             </div>
-            ${l.status === 'active' && html`
-              <div class="lab-right">
-                <div class="lab-expire">${fmtExpire(l.expires_at) || (l.expire_date ? `ถึง ${l.expire_date}` : '')}</div>
-                <div class="lab-cost">$${labCost(l).toFixed(3)}/ชม.</div>
-              </div>`}
-            <span class="lab-cta">${busy ? 'ดู log →' : 'เปิด →'}</span>
+            <div class="lab-right">
+              ${l.status === 'active' && html`
+                <${TimeBar} expiresAt=${l.expires_at} ttlHours=${l.ttl_hours} />
+                ${labCost(l) > 0 && html`<div class="lab-cost">$${labCost(l).toFixed(3)} ต่อชั่วโมง</div>`}`}
+            </div>
+            <span class="lab-cta">${busy ? 'ดู log' : 'เปิด'} →</span>
           </button>`;
         })}
-        ${destroyed.map(l => html`
+        ${destroyed.length > 0 && html`<div class="section-title" style="margin:18px 0 4px; color:var(--ink-dim); font-size:13.5px">ลบแล้ว — สร้างซ้ำจาก config เดิมได้</div>`}
+        ${destroyed.slice(0, 6).map(l => html`
           <button key=${'d-' + l.lab_name} class="recreate-card" onClick=${() => recreate(l)}>
-            <span style="font:600 14px var(--mono)">${l.lab_name}</span>
-            ถูกลบแล้ว · <span style="color:var(--accent); font-weight:600">สร้างซ้ำจาก config เดิม →</span>
+            <span class="mono" style="color:var(--ink-dim)">${l.lab_name}</span>
+            <span>${OS_LABELS[l.os] || l.os || ''}</span>
+            <span class="go">สร้างซ้ำ →</span>
           </button>`)}
       </div>
     </div>`;
@@ -346,8 +412,6 @@ function Home({ labs, loaded }) {
 // ---------------------------------------------------------------------------
 // wizard
 // ---------------------------------------------------------------------------
-
-const CUSTOM = '__custom__';
 
 // เลือก hands-on lab guide ตั้งแต่ก่อน gen — อ่านไฟล์ในเบราว์เซอร์แล้วส่งเป็น
 // ข้อความไปกับ body ตอนสร้าง (ไม่ต้องมี endpoint upload แยกและไม่ต้องพึ่ง multipart)
@@ -394,18 +458,16 @@ function GuidePicker({ value, onChange, productGuide }) {
   }
 
   const tab = (m, label) => html`
-    <button type="button" class="btn ghost small"
-      style=${value.mode === m ? 'border-color:var(--accent); color:var(--accent)' : ''}
+    <button type="button" role="tab" aria-selected=${value.mode === m} class=${value.mode === m ? 'on' : ''}
       onClick=${() => onChange({ ...value, mode: m })}>${label}</button>`;
 
   return html`
     <div class="field">
-      <label>Hands-on Lab Guide
-        <span class="opt">แนบตอนนี้ได้เลย — จะถูกรวมเข้า handout พร้อมวิธี remote เข้าเครื่องหลังสร้างเสร็จ</span></label>
-      <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap">
-        ${tab('upload', '⤒ อัปโหลดไฟล์')}
+      <label>Lab guide <span class="opt">— รวมเข้า handout ของทุกคน พร้อมวิธีเข้าเครื่อง</span></label>
+      <div class="seg" role="tablist" aria-label="lab guide">
+        ${tab('none', 'ไม่ใส่')}
+        ${tab('upload', 'อัปโหลดไฟล์')}
         ${tab('pick', 'เลือกจากที่มี')}
-        ${tab('none', 'ยังไม่ใส่')}
       </div>
 
       ${value.mode === 'upload' && html`
@@ -439,70 +501,179 @@ function GuidePicker({ value, onChange, productGuide }) {
     </div>`;
 }
 
-function Wizard({ aws }) {
+// ---------------------------------------------------------------------------
+// AWS account — เลือก/sign in ใช้ร่วมกันระหว่างหน้าสร้าง lab กับหน้า AWS accounts
+// ---------------------------------------------------------------------------
+
+// sign in SSO: backend รัน `aws sso login` (เปิดเบราว์เซอร์ให้เอง) แล้วเราคอยถามสถานะ
+function useSsoLogin(onDone, pathFor = (p) => `/aws/accounts/${encodeURIComponent(p)}/sso-login`) {
+  const [state, setState] = useState(null);   // {profile, state, url, code, error}
+  const timer = useRef(null);
+  useEffect(() => () => clearInterval(timer.current), []);
+
+  async function start(profile) {
+    clearInterval(timer.current);
+    try {
+      const st = await api(pathFor(profile), { method: 'POST' });
+      setState({ ...st, profile });
+      timer.current = setInterval(async () => {
+        try {
+          const s2 = await api(pathFor(profile));
+          setState({ ...s2, profile });
+          if (s2.state !== 'waiting') {
+            clearInterval(timer.current);
+            if (s2.state === 'done') onDone(profile);
+          }
+        } catch (e) { clearInterval(timer.current); setState({ profile, state: 'error', error: e.message }); }
+      }, 2000);
+    } catch (e) { setState({ profile, state: 'error', error: e.message }); }
+  }
+  return [state, start];
+}
+
+function SsoWait({ st }) {
+  if (!st) return null;
+  if (st.state === 'error') return html`<div class="err">sign in ${st.profile} ไม่สำเร็จ: ${st.error}</div>`;
+  if (st.state === 'done') return html`<div class="ok-box">sign in ${st.profile} แล้ว</div>`;
+  return html`
+    <div class="sso-wait" role="status">
+      <b>รอ sign in ${st.profile} ในเบราว์เซอร์…</b>
+      <div class="help" style="margin-top:4px">หน้า AWS sign-in เปิดในเบราว์เซอร์ของคุณแล้ว — กด Allow แล้วกลับมาที่นี่ หน้านี้จะไปต่อเอง</div>
+      ${st.code && html`<div style="margin-top:8px">รหัสยืนยัน <span class="code">${st.code}</span></div>`}
+      ${st.url && html`<div class="help">ถ้าเบราว์เซอร์ไม่เปิดเอง: <a href=${st.url} target="_blank" rel="noopener">เปิดหน้า sign in</a></div>`}
+    </div>`;
+}
+
+function AccountPicker({ aws, onAws }) {
+  const [list, setList] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const refresh = () => api('/aws/accounts').then(setList).catch(e => setErr(e.message));
+  useEffect(() => { refresh(); }, []);
+  const reload = async () => onAws(await api('/aws/status?force=true'));
+  const [sso, startSso] = useSsoLogin(() => reload());
+
+  async function pick(profile) {
+    setBusy(true); setErr(null);
+    try { onAws(await api('/aws/accounts/select', { method: 'POST', body: JSON.stringify({ profile }) })); }
+    catch (e) { setErr(e.message); }
+    setBusy(false);
+    refresh();
+  }
+
+  if (!list) return html`<div class="muted">${err || 'กำลังอ่าน ~/.aws…'}</div>`;
+  if (list.accounts.length === 0) {
+    return html`<div class="warn-box" style="margin:0">ยังไม่มี AWS account ในเครื่องนี้ —
+      <a href="#/aws">เพิ่ม account</a> (SSO หรือ access key) ก่อนสร้าง lab</div>`;
+  }
+  const current = aws?.profile || list.active || '';
+  const prof = list.accounts.find(a => a.name === current);
+  return html`
+    <div class="row" style="align-items:flex-end">
+      <div class="field" style="margin:0; flex:1">
+        <label for="acct">AWS account</label>
+        <select id="acct" value=${current} disabled=${busy} onChange=${(e) => pick(e.target.value)}>
+          ${!current && html`<option value="">— เลือก account —</option>`}
+          ${list.accounts.map(a => html`<option value=${a.name} key=${a.name}>
+            ${a.name}${a.account_id ? ` · ${a.account_id}` : ''}${a.kind === 'sso' ? ' · SSO' : ''}</option>`)}
+        </select>
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:9px; font-size:13.5px">
+        ${aws === null ? html`<span class="muted">กำลังเช็ค…</span>`
+          : aws.connected ? html`<span style="color:var(--good); font-weight:600">● ใช้งานได้ · <span class="mono">${aws.account}</span></span>`
+          : aws.needs_login && prof?.kind === 'sso' ? html`
+              <button class="btn primary small" onClick=${() => startSso(current)}
+                disabled=${sso?.state === 'waiting'}>Sign in ด้วย SSO</button>`
+          : current ? html`<span style="color:var(--crit); font-weight:600">● ใช้ไม่ได้</span>` : null}
+      </div>
+    </div>
+    ${aws && !aws.connected && aws.reason && !sso && current && html`<div class="help bad">${aws.reason}</div>`}
+    <${SsoWait} st=${sso} />
+    <${ErrBox} err=${err} />`;
+}
+
+// ---------------------------------------------------------------------------
+// สร้าง lab — หน้าเดียว: account → เครื่อง → ชื่อ/เวลา, ที่เหลือพับไว้ใน "ขั้นสูง"
+// ---------------------------------------------------------------------------
+
+const CUSTOM = '__custom__';
+const OS_ORDER = ['windows-2025', 'windows-2022', 'ubuntu-24.04', 'ubuntu-22.04',
+  'amazon-linux-2023', 'debian-12', 'windows-2019', 'windows-2016',
+  'amazon-linux-2', 'ubuntu-20.04', 'debian-11', 'suse-15'];
+const MAX_USERS = 50;
+const userNames = (n) => Array.from({ length: n }, (_, i) => `user${String(i + 1).padStart(2, '0')}`);
+
+function defaultLabName() {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  return `poc-${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function Wizard({ aws, onAws }) {
   const [catalog, setCatalog] = useState(null);
-  const [step, setStep] = useState(0);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const pre = PREFILL; // อ่านครั้งเดียวตอน mount
-
-  const [product, setProduct] = useState(pre ? (pre.product || CUSTOM) : null);
-  const [form, setForm] = useState({
-    lab_name: pre?.lab_name || '', region: pre?.region || 'ap-southeast-1',
-    users: pre?.users || ['user01', 'user02', 'user03'],
-    allowed_cidr: pre?.allowed_cidr || '', expire_date: pre?.expire_date || '',
-    os: pre?.os || 'ubuntu-24.04',
-    instance_type: '', root_volume_gb: '', extra_open_ports: '',
-    ttl_hours: pre?.ttl_hours != null ? String(pre.ttl_hours) : '8',
-    byol: !!pre?.custom_ami, custom_ami: pre?.custom_ami || '',
-    custom_username: pre?.custom_username || 'Administrator',
-    custom_is_windows: pre?.custom_is_windows ?? true,
-  });
-  const [params, setParams] = useState(pre?.product_params || {});
-  const [guide, setGuide] = useState({ mode: 'upload', path: '', markdown: '', pdf: '', filename: '', size: 0 });
   useEffect(() => { PREFILL = null; }, []);
-
   useEffect(() => { api('/products').then(setCatalog).catch(e => setErr(e.message)); }, []);
 
-  if (!catalog) return html`<div class="screen"><div class="card"><div class="empty">${err || 'กำลังโหลด product catalog…'}</div></div></div>`;
+  const [source, setSource] = useState(pre?.product ? 'product' : pre?.custom_ami ? 'ami' : 'os');
+  const [product, setProduct] = useState(pre?.product || null);
+  const [form, setForm] = useState({
+    lab_name: pre?.lab_name || defaultLabName(), title: pre?.title || '',
+    region: pre?.region || 'ap-southeast-1',
+    users: pre?.users || ['user01'], customNames: !!pre?.users,
+    allowed_cidr: pre?.allowed_cidr || '',
+    os: pre?.os || 'windows-2025',
+    instance_type: pre?.instance_type || '', root_volume_gb: '', extra_open_ports: '',
+    ttl_hours: pre?.ttl_hours != null ? String(pre.ttl_hours) : '8',
+    custom_ami: pre?.custom_ami || '', custom_username: pre?.custom_username || 'Administrator',
+    custom_is_windows: pre?.custom_is_windows ?? true, use_spot: !!pre?.use_spot,
+  });
+  const [params, setParams] = useState(pre?.product_params || {});
+  const [guide, setGuide] = useState({ mode: 'none', path: '', markdown: '', pdf: '', filename: '', size: 0 });
 
-  const meta = catalog.products.find(p => p.id === product);
-  const isCustom = product === CUSTOM;
+  if (!catalog) return html`<div class="screen"><div class="card"><div class="empty">${err || 'กำลังโหลด…'}</div></div></div>`;
+
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const meta = source === 'product' ? catalog.products.find(p => p.id === product) : null;
   const paramSpecs = meta ? Object.entries(meta.params) : [];
   const requiredOk = paramSpecs.every(([k, spec]) => !spec.required || (params[k] || '').trim());
-  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
-
-  const effOS = isCustom ? form.os : meta?.os;
-  const effType = form.instance_type || meta?.instance_type || 't3.medium';
+  const effOS = source === 'product' ? meta?.os : source === 'os' ? form.os : null;
+  // Windows บน t3.small อืดจนใช้ demo ไม่ได้ — default เครื่องใหญ่กว่า Linux หนึ่งขั้น
+  const isWin = (effOS || '').startsWith('windows') || (source === 'ami' && form.custom_is_windows);
+  const effType = form.instance_type || meta?.instance_type || (isWin ? 't3.medium' : 't3.small');
   const hourly = HOURLY[effType] || 0;
-  const nUsers = form.users.length;
+  const n = form.users.length;
   const ttlNum = parseFloat(form.ttl_hours) || 0;
+  const amiOk = source !== 'ami' || (/^ami-[0-9a-f]{8,17}$/.test(form.custom_ami.trim()) && form.custom_username.trim());
+  const nameOk = /^[a-z0-9-]{1,32}$/.test(form.lab_name);
+  const problems = [
+    !aws?.connected && 'ยังไม่ได้เลือก AWS account ที่ใช้งานได้',
+    !nameOk && 'ชื่อ lab ใช้ได้แค่ a-z, 0-9, - (ไม่เกิน 32 ตัว)',
+    n === 0 && 'ต้องมีอย่างน้อย 1 เครื่อง',
+    source === 'product' && !product && 'เลือก product preset',
+    source === 'product' && product && !requiredOk && 'กรอกข้อมูล product ที่จำเป็นในส่วนขั้นสูง',
+    !amiOk && 'ใส่ AMI ID (ami-xxxxxxxx) และ username',
+  ].filter(Boolean);
 
-  const stepSeq = isCustom ? [0, 1, 3] : [0, 1, 2, 3];
-  const pos = Math.max(0, stepSeq.indexOf(step));
-  const stepTitles = ['เลือก product', 'ตั้งค่า lab', 'ข้อมูล product', 'ตรวจสอบ'];
-  const byolOk = !form.byol ||
-    (/^ami-[0-9a-f]{8,17}$/.test(form.custom_ami.trim()) && form.custom_username.trim());
-  const canNext = {
-    0: product !== null,
-    1: /^[a-z0-9-]{1,32}$/.test(form.lab_name) && nUsers > 0 && byolOk,
-    2: requiredOk,
-  }[step] ?? true;
+  const setCount = (c) => setForm({ ...form, users: userNames(Math.min(MAX_USERS, Math.max(1, c || 1))), customNames: false });
 
   async function submit() {
+    if (problems.length) return;
     setBusy(true); setErr(null);
     const body = {
-      lab_name: form.lab_name.trim(), users: form.users,
+      lab_name: form.lab_name.trim(), users: form.users, title: form.title.trim() || null,
       region: form.region || null, allowed_cidr: form.allowed_cidr || null,
-      expire_date: form.expire_date || null,
       ttl_hours: form.ttl_hours === '' ? 8 : parseFloat(form.ttl_hours),
+      use_spot: form.use_spot || null,
     };
-    if (isCustom) {
-      if (form.byol) {
-        body.custom_ami = form.custom_ami.trim();
-        body.custom_username = form.custom_username.trim();
-        body.custom_is_windows = form.custom_is_windows;
-      } else body.os = form.os;
+    if (source === 'ami') {
+      body.custom_ami = form.custom_ami.trim();
+      body.custom_username = form.custom_username.trim();
+      body.custom_is_windows = form.custom_is_windows;
+    } else if (source === 'os') {
+      body.os = form.os;
     } else {
       body.product = product;
       body.product_params = Object.fromEntries(
@@ -512,10 +683,11 @@ function Wizard({ aws }) {
     else if (guide.mode === 'upload' && guide.markdown.trim()) body.lab_guide_markdown = guide.markdown;
     else if (guide.mode === 'pick' && guide.path) body.lab_guide = guide.path;
     if (form.instance_type) body.instance_type = form.instance_type;
+    else if (source === 'os') body.instance_type = effType;
     if (form.root_volume_gb) body.root_volume_gb = parseInt(form.root_volume_gb, 10);
     if (form.extra_open_ports.trim()) {
       body.extra_open_ports = form.extra_open_ports.split(',')
-        .map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        .map(x => parseInt(x.trim(), 10)).filter(x => !isNaN(x));
     }
     try {
       const r = await api('/labs', { method: 'POST', body: JSON.stringify(body) });
@@ -523,159 +695,147 @@ function Wizard({ aws }) {
     } catch (e) { setErr(e.message); setBusy(false); }
   }
 
+  const osList = OS_ORDER.filter(o => catalog.supported_os.includes(o));
+  const machineLabel = source === 'ami' ? `AMI ${form.custom_ami || '—'}`
+    : source === 'product' ? (meta?.product_name || 'ยังไม่เลือก') : (OS_LABELS[form.os] || form.os);
+
   return html`
     <div class="screen">
-      <h1 class="page-title" style="margin-bottom:16px">สร้าง lab ใหม่ ${' '}
-        <span class="mono muted" style="font:500 12.5px var(--mono)">· ขั้นตอน ${pos + 1}/${stepSeq.length} — ${stepTitles[step]}</span></h1>
-      <div class="wiz-wrap">
-        <div class="wiz-main card">
-          <div class="stepper">
-            ${stepSeq.map((s, i) => html`<div class="s ${i < pos ? 'done' : i === pos ? 'now' : ''}"></div>`)}
-          </div>
-          ${aws && !aws.connected && html`
-            <div class="callout" style="margin:0 0 16px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
-              <span>ยังไม่ได้เชื่อมต่อ AWS — ต้องเชื่อมต่อก่อนจึงจะสร้าง lab ได้</span>
-              <button class="btn primary small" onClick=${() => nav('/aws')}>เชื่อมต่อ AWS →</button>
-            </div>`}
-          <${ErrBox} err=${err} />
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">สร้าง lab</h1>
+          <div class="page-sub">แต่ละคนได้ VM ของตัวเอง แยก VPC ต่อ lab — ลบทิ้งได้ทั้งหมดในครั้งเดียว</div>
+        </div>
+      </div>
+      <div class="create-wrap">
+        <div class="card create-card">
+          <section class="form-block">
+            <h2 class="block-title"><span class="step-n">1</span>สร้างใน AWS account ไหน</h2>
+            <${AccountPicker} aws=${aws} onAws=${onAws} />
+          </section>
 
-          ${step === 0 && html`
-            <div class="step-title">Lab นี้สอนอะไร?</div>
-            <div class="prod-grid">
-              ${catalog.products.map(p => html`
-                <button key=${p.id} class="prod-card ${product === p.id ? 'selected' : ''}" onClick=${() => setProduct(p.id)}>
-                  <div class="pname">${p.product_name}</div>
-                  <div class="pdesc">${p.description}</div>
-                  <div class="pspec"><span>OS ${p.os}</span><span>${p.instance_type} · ${p.root_volume_gb}GB</span></div>
-                </button>`)}
-              <button class="prod-card ${product === CUSTOM ? 'selected' : ''}" onClick=${() => setProduct(CUSTOM)}>
-                <div class="pname">Custom OS lab</div>
-                <div class="pdesc">ไม่ติดตั้ง product agent — เลือก OS เอง (Linux/Windows Server) หรือใช้ AMI ของตัวเอง (BYOL เช่น Windows 10/11)</div>
-                <div class="pspec"><span>${catalog.supported_os.length} OS ให้เลือก + custom AMI (BYOL)</span><span>กำหนดสเปคเองได้</span></div>
-              </button>
-            </div>`}
-
-          ${step === 1 && html`
-            <div class="step-title">ตั้งค่า lab</div>
-            <div class="row">
-              <div class="field"><label>lab_name <span class="req">*</span></label>
-                <input type="text" value=${form.lab_name} onInput=${set('lab_name')} placeholder="เช่น trendai-training" />
-                ${form.lab_name && !/^[a-z0-9-]{1,32}$/.test(form.lab_name)
-                  && html`<div class="help bad">ใช้ได้เฉพาะ a-z, 0-9, - (ไม่เกิน 32 ตัว)</div>`}</div>
-              <div class="field"><label>region</label>
-                <input type="text" value=${form.region} onInput=${set('region')} /></div>
+          <section class="form-block">
+            <h2 class="block-title"><span class="step-n">2</span>เครื่อง</h2>
+            <div class="seg" role="tablist" aria-label="ที่มาของเครื่อง">
+              ${[['os', 'เลือก OS'], ['product', 'Product preset'], ['ami', 'AMI ของตัวเอง']].map(([k, l]) => html`
+                <button role="tab" aria-selected=${source === k} class=${source === k ? 'on' : ''}
+                  onClick=${() => setSource(k)}>${l}</button>`)}
             </div>
-            <${UserEditor} users=${form.users} onChange=${(users) => setForm({ ...form, users })} />
-            <div class="row">
-              <div class="field"><label>allowed_cidr</label>
-                <input type="text" value=${form.allowed_cidr} onInput=${set('allowed_cidr')} placeholder="0.0.0.0/0" />
-                <div class="help">จำกัดให้แคบที่สุด เช่น IP ของสถานที่อบรม — เลี่ยง 0.0.0.0/0 ถ้าทำได้</div></div>
-              <div class="field" style="flex:0 0 190px; min-width:170px"><label>session หมดอายุใน (ชม.)</label>
-                <input type="number" min="0" max="336" step="0.5" value=${form.ttl_hours} onInput=${set('ttl_hours')} />
-                <div class="help">ครบแล้ว<b>ลบอัตโนมัติ</b> · 0 = ปิด</div></div>
-            </div>
-            ${isCustom && html`
-              <div class="field" style="max-width:280px"><label>os</label>
-                <select value=${form.os} onChange=${set('os')} disabled=${form.byol}>
-                  ${catalog.supported_os.map(o => html`<option value=${o}>${OS_LABELS[o] || o}</option>`)}
-                </select></div>
-              <div class="field"><label class="checkbox">
-                <input type="checkbox" checked=${form.byol}
-                  onChange=${(e) => setForm({ ...form, byol: e.target.checked })} />
-                ใช้ AMI ของตัวเอง (BYOL) — จำเป็นสำหรับ Windows 10/11 ที่ import license เอง
-              </label></div>
-              ${form.byol && html`
-                <div class="row">
-                  <div class="field"><label>custom AMI ID <span class="req">*</span></label>
-                    <input type="text" value=${form.custom_ami} onInput=${set('custom_ami')} placeholder="ami-0123456789abcdef0" />
-                    ${form.custom_ami && !/^ami-[0-9a-f]{8,17}$/.test(form.custom_ami.trim())
-                      && html`<div class="help bad">รูปแบบต้องเป็น ami-xxxxxxxx</div>`}</div>
-                  <div class="field"><label>username <span class="req">*</span></label>
-                    <input type="text" value=${form.custom_username} onInput=${set('custom_username')} /></div>
-                </div>
-                <div class="field"><label class="checkbox">
-                  <input type="checkbox" checked=${form.custom_is_windows}
-                    onChange=${(e) => setForm({ ...form, custom_is_windows: e.target.checked })} />
-                  AMI นี้เป็น Windows (ใช้ RDP + ถอดรหัสผ่านจาก key)
-                </label></div>`}`}
-            <${GuidePicker} value=${guide} onChange=${setGuide} productGuide=${meta?.lab_guide ? meta.product_name : null} />
-            <details style="margin-top:4px">
-              <summary style="font:500 12.5px var(--mono); color:var(--ink-dim); cursor:pointer; margin-bottom:10px">ขั้นสูง (instance_type, root_volume_gb, extra_open_ports)</summary>
+            ${source === 'os' && html`
+              <div class="os-grid">
+                ${osList.map(o => html`
+                  <button key=${o} class="os-opt ${osFamily(o)}" aria-pressed=${form.os === o}
+                    onClick=${() => setForm({ ...form, os: o })}>
+                    <span class="n">${OS_LABELS[o] || o}</span>
+                    <span class="m">${o.startsWith('windows') ? 'RDP · พร้อมใช้ ~5 นาที' : 'SSH · พร้อมใช้ ~2 นาที'}</span>
+                  </button>`)}
+              </div>`}
+            ${source === 'product' && html`
+              <div class="prod-grid">
+                ${catalog.products.map(p => html`
+                  <button key=${p.id} class="prod-card" aria-pressed=${product === p.id} onClick=${() => setProduct(p.id)}>
+                    <div class="pname">${p.product_name}</div>
+                    <div class="pdesc">${p.description}</div>
+                  </button>`)}
+                ${catalog.products.length === 0 && html`<div class="muted">ยังไม่มี product preset ในโฟลเดอร์ products/</div>`}
+              </div>`}
+            ${source === 'ami' && html`
               <div class="row">
-                <div class="field"><label>instance_type</label>
-                  <input type="text" value=${form.instance_type} onInput=${set('instance_type')}
-                    placeholder=${meta?.instance_type || 't3.medium'} /></div>
-                <div class="field"><label>root_volume_gb</label>
-                  <input type="number" value=${form.root_volume_gb} onInput=${set('root_volume_gb')}
-                    placeholder=${meta?.root_volume_gb || 30} /></div>
-                <div class="field"><label>extra_open_ports</label>
-                  <input type="text" value=${form.extra_open_ports} onInput=${set('extra_open_ports')} placeholder="80, 8080" /></div>
+                <div class="field"><label for="ami">AMI ID <span class="req">*</span></label>
+                  <input id="ami" class="mono" type="text" value=${form.custom_ami} onInput=${set('custom_ami')} placeholder="ami-0123456789abcdef0" /></div>
+                <div class="field"><label for="amiu">Username <span class="req">*</span></label>
+                  <input id="amiu" type="text" value=${form.custom_username} onInput=${set('custom_username')} /></div>
               </div>
-            </details>`}
+              <label class="checkbox"><input type="checkbox" checked=${form.custom_is_windows}
+                onChange=${(e) => setForm({ ...form, custom_is_windows: e.target.checked })} />
+                AMI นี้เป็น Windows (เข้าด้วย RDP และถอดรหัสผ่านจาก key)</label>`}
 
-          ${step === 2 && meta && html`
-            <div class="step-title" style="margin-bottom:6px">${meta.product_name} — ข้อมูล tenant</div>
-            <div class="page-sub" style="margin-bottom:18px">ค่าเหล่านี้จะถูกเติมลงใน bootstrap script และ lab guide แทนที่ placeholder ใน template</div>
-            ${paramSpecs.map(([key, spec]) => html`
-              <div class="field" key=${key}>
-                <label>${key} ${spec.required
-                  ? html`<span class="req">*</span>`
-                  : html`<span class="opt">optional${spec.default ? ` — default: ${spec.default}` : ''}</span>`}</label>
-                <input type="text" value=${params[key] || ''}
-                  onInput=${(e) => setParams({ ...params, [key]: e.target.value })} />
-                ${spec.description && html`<div class="help">${spec.description}</div>`}
-              </div>`)}`}
-
-          ${step === 3 && html`
-            <div class="step-title">ตรวจสอบก่อนสร้าง</div>
-            <div class="review-rows">
-              <div class="review-row"><span class="k">Lab</span>
-                <span class="v">${form.lab_name || '—'} ${meta ? `— ${meta.product_name}` : form.byol ? '(custom AMI)' : '(custom OS)'}</span></div>
-              <div class="review-row"><span class="k">เครื่อง</span>
-                <span class="v">${nUsers} × ${isCustom && form.byol ? `AMI ${form.custom_ami}` : (OS_LABELS[effOS] || effOS)}, ${effType}</span></div>
-              <div class="review-row"><span class="k">Auto-expire</span>
-                <span class="v">${ttlNum > 0 ? `ลบอัตโนมัติหลัง ${form.ttl_hours} ชั่วโมง` : 'ปิด — ต้องกด Destroy เองตอนจบ'}</span></div>
-              <div class="review-row"><span class="k">Lab guide</span>
-                <span class="v">${guide.mode === 'upload' && guide.filename
-                  ? `${guide.filename} (อัปโหลด${guide.pdf ? ' PDF' : ''})`
-                  : guide.mode === 'pick' && guide.path ? guide.path
-                  : meta?.lab_guide ? `guide มาตรฐานของ ${meta.product_name}`
-                  : 'ไม่ใส่ — handout จะมีเฉพาะวิธีเข้าเครื่อง'}</span></div>
-              <div class="review-row"><span class="k">Region</span><span class="v">${form.region}</span></div>
-              <div class="review-row"><span class="k">ผู้เรียน</span><span class="v">${form.users.join(', ')}</span></div>
-              ${!isCustom && paramSpecs.filter(([, s]) => s.required).map(([k]) => html`
-                <div class="review-row" key=${k}><span class="k">${k}</span><span class="v">${params[k] || '—'}</span></div>`)}
-              <div class="review-row"><span class="k">ค่าใช้จ่าย</span>
-                <span class="v">~$${(hourly * nUsers).toFixed(3)}/ชม. รวม · ~$${(hourly * nUsers * (ttlNum || 8)).toFixed(2)} ต่อ session ${ttlNum || 8} ชม.</span></div>
+            <div style="display:flex; gap:28px; flex-wrap:wrap; margin-top:20px; align-items:flex-end">
+              <div>
+                <div class="flabel">จำนวนเครื่อง <span class="opt">— คนละเครื่อง</span></div>
+                <div class="stepper">
+                  <button aria-label="ลด" disabled=${n <= 1} onClick=${() => setCount(n - 1)}>−</button>
+                  <input type="number" min="1" max=${MAX_USERS} value=${n} aria-label="จำนวนเครื่อง"
+                    onInput=${(e) => setCount(parseInt(e.target.value, 10))} />
+                  <button aria-label="เพิ่ม" disabled=${n >= MAX_USERS} onClick=${() => setCount(n + 1)}>+</button>
+                </div>
+              </div>
+              <div class="tagrow" style="flex:1; min-width:200px; padding-bottom:8px">
+                ${form.users.slice(0, 8).map(u => html`<span class="tag" key=${u}>${u}</span>`)}
+                ${n > 8 && html`<span class="muted">+${n - 8}</span>`}
+              </div>
             </div>
-            <div class="callout">อย่าลืม <b>ลบ lab (Destroy)</b> เมื่อจบ training — VM, network และ key ทั้งหมดจะถูกลบ ไม่มีอะไรค้างคิดเงินต่อ</div>`}
+          </section>
 
-          <div class="btnbar">
-            ${pos > 0 && html`<button class="btn ghost" style="margin-right:auto"
-              onClick=${() => setStep(stepSeq[pos - 1])}>← ย้อนกลับ</button>`}
-            <button class="btn ghost" onClick=${() => nav('/')}>ยกเลิก</button>
-            ${pos < stepSeq.length - 1
-              ? html`<button class="btn primary" disabled=${!canNext}
-                  onClick=${() => setStep(stepSeq[pos + 1])}>ถัดไป →</button>`
-              : html`<button class="btn primary" disabled=${busy || (aws && !aws.connected)}
-                  onClick=${submit}>${busy ? 'กำลังส่ง…' : '🚀 สร้าง lab'}</button>`}
-          </div>
+          <section class="form-block">
+            <h2 class="block-title"><span class="step-n">3</span>ชื่อและเวลา</h2>
+            <div class="row">
+              <div class="field"><label for="ln">ชื่อ lab <span class="opt">— ใช้เป็น prefix ของ resource บน AWS</span></label>
+                <input id="ln" class="mono" type="text" value=${form.lab_name} onInput=${set('lab_name')} />
+                ${form.lab_name && !nameOk && html`<div class="help bad">ใช้ได้แค่ a-z, 0-9, - (ไม่เกิน 32 ตัว)</div>`}</div>
+              <div class="field" style="flex:0 0 200px; min-width:180px"><label for="ttl">ลบอัตโนมัติหลัง (ชม.)</label>
+                <input id="ttl" type="number" min="0" max="336" step="0.5" value=${form.ttl_hours} onInput=${set('ttl_hours')} />
+                <div class="help">0 = ไม่ลบเอง</div></div>
+            </div>
+            <div class="field" style="margin-bottom:0"><label for="tt">ชื่อที่แสดง <span class="opt">— ไม่บังคับ เช่นชื่อลูกค้า/งาน</span></label>
+              <input id="tt" type="text" value=${form.title} onInput=${set('title')} placeholder="เช่น PoC ลูกค้า BGC" /></div>
+          </section>
+
+          <section class="form-block">
+            <details>
+              <summary>ขั้นสูง — ชื่อผู้ใช้เอง, ขนาดเครื่อง, network, lab guide${paramSpecs.length ? ', ข้อมูล product' : ''}</summary>
+              <div style="margin-top:14px">
+                <${UserEditor} users=${form.users} onChange=${(users) => setForm({ ...form, users, customNames: true })} />
+                <div class="row">
+                  <div class="field"><label for="it">Instance type</label>
+                    <input id="it" class="mono" type="text" value=${form.instance_type} onInput=${set('instance_type')} placeholder=${effType} /></div>
+                  <div class="field"><label for="disk">Disk (GB)</label>
+                    <input id="disk" type="number" value=${form.root_volume_gb} onInput=${set('root_volume_gb')} placeholder=${meta?.root_volume_gb || 30} /></div>
+                  <div class="field"><label for="rg">Region</label>
+                    <input id="rg" class="mono" type="text" value=${form.region} onInput=${set('region')} /></div>
+                </div>
+                <div class="row">
+                  <div class="field"><label for="cidr">เปิดให้เข้าจาก (CIDR)</label>
+                    <input id="cidr" class="mono" type="text" value=${form.allowed_cidr} onInput=${set('allowed_cidr')} placeholder="0.0.0.0/0" />
+                    <div class="help">แคบได้ยิ่งดี เช่น IP ของห้องประชุมลูกค้า</div></div>
+                  <div class="field"><label for="ports">พอร์ตเพิ่ม</label>
+                    <input id="ports" class="mono" type="text" value=${form.extra_open_ports} onInput=${set('extra_open_ports')} placeholder="80, 8080" /></div>
+                </div>
+                <label class="checkbox" style="margin-bottom:18px"><input type="checkbox" checked=${form.use_spot}
+                  onChange=${(e) => setForm({ ...form, use_spot: e.target.checked })} />
+                  ใช้ spot instance — ถูกกว่า ~60% แต่ AWS ยึดคืนได้ และหยุดชั่วคราว (stop) ไม่ได้</label>
+                ${paramSpecs.map(([key, spec]) => html`
+                  <div class="field" key=${key}>
+                    <label>${key} ${spec.required ? html`<span class="req">*</span>`
+                      : html`<span class="opt">ไม่บังคับ${spec.default ? ` — default ${spec.default}` : ''}</span>`}</label>
+                    <input type="text" value=${params[key] || ''} onInput=${(e) => setParams({ ...params, [key]: e.target.value })} />
+                    ${spec.description && html`<div class="help">${spec.description}</div>`}
+                  </div>`)}
+                <${GuidePicker} value=${guide} onChange=${setGuide} productGuide=${meta?.lab_guide ? meta.product_name : null} />
+              </div>
+            </details>
+          </section>
         </div>
 
-        <div class="cost-panel">
-          <div class="card" style="padding:18px 20px">
-            <div class="cost-title">ค่าใช้จ่ายโดยประมาณ · LIVE</div>
-            <div class="cost-big">$${(hourly * nUsers).toFixed(3)}<span class="unit">/ชม.</span></div>
-            <div class="cost-session">≈ $${(hourly * nUsers * (ttlNum || 8)).toFixed(2)} ต่อ session ${form.ttl_hours || 8} ชม.</div>
-            <div class="cost-rows">
-              <div><span>เครื่อง</span><span class="v">${nUsers} × ${effType}</span></div>
-              <div><span>ราคา/เครื่อง</span><span class="v">$${hourly.toFixed(4)}/ชม.</span></div>
-              <div><span>OS</span><span class="v">${isCustom && form.byol ? 'custom AMI' : (OS_LABELS[effOS] || effOS || (product ? '' : 'ยังไม่เลือก'))}</span></div>
-              <div><span>Auto-expire</span><span class="v">${ttlNum > 0 ? `${form.ttl_hours} ชม.` : 'ปิด'}</span></div>
-            </div>
-            <div class="cost-foot">on-demand ap-southeast-1 + EBS gp3 เล็กน้อย</div>
+        <aside class="card summary" aria-label="สรุปก่อนสร้าง">
+          <div class="head">
+            <div class="t">ค่าใช้จ่ายโดยประมาณ</div>
+            <div class="big">$${(hourly * n).toFixed(3)}<span class="unit">/ชม.</span></div>
           </div>
-        </div>
+          <div class="body">
+            <div class="rows">
+              <div><span class="k">Account</span><span class="v">${aws?.connected ? (aws.profile || aws.account) : '—'}</span></div>
+              <div><span class="k">เครื่อง</span><span class="v">${n} × ${machineLabel}</span></div>
+              <div><span class="k">ขนาด</span><span class="v mono">${effType}</span></div>
+              <div><span class="k">ลบอัตโนมัติ</span><span class="v">${ttlNum > 0 ? `${form.ttl_hours} ชม. (~$${(hourly * n * ttlNum).toFixed(2)})` : 'ปิด'}</span></div>
+            </div>
+            <${ErrBox} err=${err} />
+            ${problems.length > 0 && html`<div class="help bad" style="margin-top:12px">${problems[0]}</div>`}
+            <button class="btn primary block" style="margin-top:14px" disabled=${busy || problems.length > 0} onClick=${submit}>
+              ${busy ? 'กำลังส่ง…' : `สร้าง ${n} เครื่อง`}</button>
+            <div class="foot">on-demand ${form.region} · ราคาจริงอาจต่างเล็กน้อย (EBS, network)</div>
+          </div>
+        </aside>
       </div>
     </div>`;
 }
@@ -726,6 +886,8 @@ const PHASES = {
   refresh: [['refresh', 'ดึงสถานะล่าสุดจาก AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   reset: [['reset', 'สร้างเครื่องของผู้เรียนใหม่'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   export: [['export', 'สร้าง handout + zip ใหม่'], ['done', 'เสร็จสิ้น']],
+  retire_account: [['done', 'destroy lab ครบ → sign out SSO → ลบโปรไฟล์']],
+  remove_user: [['destroy', 'ลบเครื่องบน AWS'], ['cleanup', 'ลบ key/handout ของเครื่องนี้'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   add_users: [['apply', 'สร้างเครื่องที่เพิ่มบน AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   destroy: [['destroy', 'ลบ resource ทั้งหมดบน AWS'], ['cleanup', 'ลบ key/handout ในเครื่อง'], ['done', 'เสร็จสิ้น']],
 };
@@ -778,8 +940,10 @@ function JobView({ jobId, labName }) {
     <div class="screen" style="max-width:920px">
       <h1 class="page-title" style="margin-bottom:16px">
         ${done ? (failed ? 'งานล้มเหลว' : kind === 'destroy' ? 'ลบเสร็จแล้ว'
+            : kind === 'retire_account' ? 'ลบ account เสร็จแล้ว' : kind === 'remove_user' ? 'ลบเครื่องเสร็จแล้ว' : kind === 'add_users' ? 'เพิ่มเครื่องเสร็จแล้ว'
             : kind === 'export' ? 'สร้าง handout ใหม่เสร็จแล้ว' : 'สร้างเสร็จแล้ว')
-          : kind === 'destroy' ? 'กำลังลบ' : kind === 'refresh' ? 'กำลัง refresh'
+          : kind === 'destroy' ? 'กำลังลบ' : kind === 'retire_account' ? 'กำลังลบ account' : kind === 'remove_user' ? 'กำลังลบเครื่อง'
+          : kind === 'add_users' ? 'กำลังเพิ่มเครื่อง' : kind === 'refresh' ? 'กำลัง refresh'
           : kind === 'export' ? 'กำลังสร้าง handout ใหม่' : 'กำลังสร้าง'}
         ${' '}<span class="mono muted" style="font:500 14px var(--mono)">${labName}</span></h1>
       <div class="card">
@@ -1066,6 +1230,41 @@ function AddUsersModal({ labName, existing, labOs, onClose }) {
     </div>`;
 }
 
+function RemoveUserModal({ labName, machine, onClose }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && !busy) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
+  async function submit() {
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/labs/${labName}/users/${machine.user}`, { method: 'DELETE' });
+      nav(`/job/${r.job_id}?lab=${labName}`);
+    } catch (e) { setErr(e.message); setBusy(false); }
+  }
+
+  return html`
+    <div class="modal-overlay" onClick=${(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+      <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="rm-title">
+        <div id="rm-title" class="modal-title">ลบเครื่องของ <span class="mono">${machine.user}</span>?</div>
+        <div class="modal-sub" style="margin-bottom:0">
+          VM <span class="mono">${machine.public_ip || machine.instance_id}</span>, key และ handout
+          ของคนนี้จะถูกลบถาวร — เครื่องคนอื่นในคลาสไม่กระทบ</div>
+        <${ErrBox} err=${err} />
+        <div class="modal-actions">
+          <button class="btn ghost" disabled=${busy} onClick=${onClose} autofocus>ยกเลิก</button>
+          <button class="btn danger" disabled=${busy} style="background:var(--crit); color:#fff"
+            onClick=${submit}>${busy ? 'กำลังเริ่ม…' : 'ลบเครื่องนี้'}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function Dashboard({ labName }) {
   const [lab, setLab] = useState(null);
   const [err, setErr] = useState(null);
@@ -1079,6 +1278,7 @@ function Dashboard({ labName }) {
   const [reach, setReach] = useState({});
   const [reachBusy, setReachBusy] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [removing, setRemoving] = useState(null);
 
   const load = useCallback(() => {
     api(`/labs/${labName}`).then(setLab).catch(e => setErr(e.message));
@@ -1158,102 +1358,119 @@ function Dashboard({ labName }) {
   if (!lab) return html`<div class="screen"><div class="card"><div class="empty">${err || 'กำลังโหลด…'}</div></div></div>`;
 
   const busyJob = lab.job && ['queued', 'running'].includes(lab.job.state);
-  const expireTxt = lab.status === 'active' && lab.expires_at
-    ? ` · ลบอัตโนมัติใน ${(fmtExpire(lab.expires_at) || '').replace('⏳ ', '')}` : '';
+  const msLeft = lab.expires_at ? lab.expires_at * 1000 - Date.now() : null;
+  const isActive = lab.status === 'active';
 
   return html`
     <div class="screen">
-      <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:20px">
-        <div>
-          <h1 class="page-title">${lab.title || lab.product_name || lab.lab_name}
-            <span class="mono muted" style="font:500 13px var(--mono)"> — ${lab.lab_name}</span></h1>
-          <div style="display:flex; align-items:center; gap:10px; margin-top:7px">
+      <header class="lab-head">
+        <div style="min-width:0">
+          <h1>${lab.title || lab.product_name || lab.lab_name}</h1>
+          <div class="meta">
             <${Pill} status=${lab.status} />
-            <span class="mono muted" style="font-size:12px">
-              ${[OS_LABELS[lab.os] || lab.os, lab.instance_type, lab.region].filter(Boolean).join(' · ')}${expireTxt}</span>
+            <span class="mono">${lab.lab_name}</span>
+            <span class="sep">/</span>
+            <span>${[OS_LABELS[lab.os] || lab.os, lab.instance_type, lab.region].filter(Boolean).join(' · ')}</span>
+            ${(lab.aws_profile || lab.aws_account) && html`<span class="sep">/</span>
+              <span title="AWS account ที่ lab นี้อยู่">${lab.aws_profile || 'AWS'} <span class="mono">${lab.aws_account || ''}</span></span>`}
           </div>
         </div>
-        <div style="display:flex; gap:8px; flex-wrap:wrap">
-          ${busyJob && html`<button class="btn ghost small"
+        <div class="actions">
+          ${busyJob && html`<button class="btn primary small"
             onClick=${() => nav(`/job/${lab.job.id}?lab=${labName}`)}>ดูงานที่กำลังรัน →</button>`}
           ${!busyJob && lab.job && lab.job.state === 'error' && html`<button class="btn ghost small"
-            onClick=${() => nav(`/job/${lab.job.id}?lab=${labName}`)}>ดู log ที่ล้มเหลว →</button>`}
+            onClick=${() => nav(`/job/${lab.job.id}?lab=${labName}`)}>ดู log ที่ล้มเหลว</button>`}
           <button class="btn ghost small" onClick=${checkReach} disabled=${reachBusy || busyJob}>
-            ${reachBusy ? 'กำลังตรวจ…' : '⇄ ตรวจการเชื่อมต่อ'}</button>
-          <button class="btn ghost small" onClick=${cloneLab}>⧉ สร้างซ้ำ</button>
-          ${lab.status === 'active' && html`<button class="btn ghost small" disabled=${busyJob}
-            title="สร้างเครื่องให้ผู้เรียนเพิ่ม เครื่องเดิมไม่กระทบ"
-            onClick=${() => setAddOpen(true)}>＋ เพิ่มเครื่อง</button>`}
-          ${lab.status === 'active' && html`<button class="btn ghost small" disabled=${busyJob}
-            onClick=${() => doExtend(1)}>+1 ชม.</button>`}
-          <button class="btn ghost small" onClick=${doRefresh} disabled=${busyJob}>↻ Refresh</button>
-          <a class="btn ghost small" href="/api/labs/${labName}/handouts/export" download>⤓ Export ทั้งหมด</a>
+            ${reachBusy ? 'กำลังตรวจ…' : 'ตรวจการเชื่อมต่อ'}</button>
+          <button class="btn ghost small" onClick=${doRefresh} disabled=${busyJob}><${Icon} name="refresh" />Refresh</button>
+          <a class="btn ghost small" href="/api/labs/${labName}/handouts/export" download><${Icon} name="download" />handout ทั้งหมด</a>
+          <button class="btn ghost small" onClick=${cloneLab}>สร้างซ้ำ</button>
           <button class="btn danger small" disabled=${busyJob}
             onClick=${() => { setConfirmText(''); setDestroyOpen(true); }}>Destroy…</button>
         </div>
-      </div>
+        ${isActive && html`
+          <div class="timeline">
+            <span class="k">ลบอัตโนมัติใน</span>
+            <${TimeBar} expiresAt=${lab.expires_at} ttlHours=${lab.ttl_hours} />
+            <span class="btn-row" style=${lab.expires_at ? '' : 'visibility:hidden'}>
+              <button class="btn ghost small" disabled=${busyJob} onClick=${() => doExtend(1)}>+1 ชม.</button>
+              <button class="btn ghost small" disabled=${busyJob} onClick=${() => doExtend(2)}>+2 ชม.</button>
+            </span>
+          </div>`}
+      </header>
       <${ErrBox} err=${err} />
-      ${notice && html`<div class="ok-box" style="margin-bottom:14px">✔ ${notice}</div>`}
-      ${lab.status === 'active' && lab.expires_at
-        && (lab.expires_at * 1000 - Date.now()) < 30 * 60000
-        && (lab.expires_at * 1000 - Date.now()) > 0 && html`
-        <div class="warn-box" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
-          <span>lab นี้จะถูกลบอัตโนมัติใน ${Math.max(0, Math.round((lab.expires_at * 1000 - Date.now()) / 60000))} นาที
-            — ถ้าคลาสยังไม่จบให้ต่อเวลาก่อน</span>
-          <span style="display:flex; gap:6px">
-            <button class="btn ghost small" onClick=${() => doExtend(1)}>+1 ชม.</button>
-            <button class="btn ghost small" onClick=${() => doExtend(2)}>+2 ชม.</button>
-          </span>
-        </div>`}
+      ${notice && html`<div class="ok-box">${notice}</div>`}
+      ${isActive && msLeft !== null && msLeft > 0 && msLeft < 30 * 60000 && html`
+        <div class="warn-box">lab นี้จะถูกลบอัตโนมัติใน ${Math.round(msLeft / 60000)} นาที — ถ้ายังใช้อยู่ ให้กด +1 ชม. ก่อน</div>`}
 
-      ${lab.status === 'active' && lab.machines.length > 0
-        && html`<${GuideCard} labName=${labName} disabled=${busyJob} onDone=${load} />`}
-
+      <div class="desk-head">
+        <h2>${lab.machines.length} เครื่อง</h2>
+        ${isActive && lab.machines.length > 0 && html`<span class="muted" style="font-size:13px">
+          บัตรละหนึ่งคน · reset/ลบทีละเครื่องได้ เครื่องอื่นไม่กระทบ</span>`}
+      </div>
       ${lab.machines.length === 0
         ? html`<div class="card"><div class="empty">
             ${lab.status === 'destroyed' ? 'lab นี้ถูกลบแล้ว'
-             : ['queued', 'provisioning'].includes(lab.status) ? 'กำลังสร้างเครื่อง — ดูความคืบหน้าจากปุ่มด้านบน'
+             : ['queued', 'provisioning'].includes(lab.status) ? 'กำลังสร้างเครื่อง — ดูความคืบหน้าได้จากปุ่ม "ดูงานที่กำลังรัน"'
              : 'ยังอ่านข้อมูลเครื่องไม่ได้ — ลอง Refresh'}</div></div>`
         : html`
         <div class="mac-grid">
-          ${lab.machines.map(m => html`
-            <div class="mac-card" key=${m.user}>
-              <div class="mac-head">
-                <div class="mac-user"><span class="mac-dot ${m.public_ip ? '' : 'off'}"></span>${m.user}</div>
-                <span class="mac-proto">
-                  ${reach[m.user] && html`<span style="color:${reach[m.user].reachable ? 'var(--good)' : 'var(--crit)'}">
-                    ${reach[m.user].reachable ? `● พร้อม ${reach[m.user].ms}ms` : '● ต่อไม่ได้'} · </span>`}
-                  ${m.os !== lab.os && OS_LABELS[m.os] ? `${OS_LABELS[m.os]} · ` : ''}${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
+          ${lab.machines.map(m => {
+            const r = reach[m.user];
+            const pending = !m.public_ip || (m.is_windows && m.password === null);
+            const state = r && !r.reachable ? 'down' : pending ? 'pending' : '';
+            const statusText = r ? (r.reachable ? `พร้อมใช้ · ตอบใน ${r.ms} ms` : 'ติดต่อเครื่องไม่ได้')
+              : !m.public_ip ? 'ยังไม่มี IP' : pending ? 'กำลังบูต — รอรหัสผ่าน Windows' : 'พร้อมใช้';
+            return html`
+            <article class="badge ${osFamily(m.os, m.is_windows)} ${state}" key=${m.user}>
+              <div class="band">
+                <span>${OS_LABELS[m.os] || m.os}</span>
+                <span class="proto">${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
               </div>
-              <div class="mac-rows">
-                <div><span class="k">Public IP</span>
-                  <span class="flex-center-gap">
-                    <span class="v">${m.public_ip || '—'}</span>
-                    ${m.public_ip && html`<button class="btn tiny"
-                      style=${copied[m.user] ? 'color:var(--good); border-color:var(--good)' : ''}
-                      onClick=${() => copyIp(m)}>${copied[m.user] ? '✓ คัดลอกแล้ว' : 'คัดลอก'}</button>`}
-                  </span></div>
-                <div><span class="k">Username</span><span class="v">${m.username}</span></div>
+              <div class="who">
+                <div class="name">${m.user}</div>
+                <div class="status-line">● ${statusText}</div>
+              </div>
+              <div class="fine">
+                <div><span class="k">IP</span><span class="v">${m.public_ip || '—'}</span>
+                  ${m.public_ip ? html`<button class="btn tiny" aria-label="คัดลอก IP ของ ${m.user}"
+                    style=${copied[m.user] ? 'color:var(--good); border-color:var(--good)' : ''}
+                    onClick=${() => copyIp(m)}>${copied[m.user] ? 'คัดลอกแล้ว' : 'คัดลอก'}</button>` : html`<span></span>`}</div>
+                <div><span class="k">Username</span><span class="v">${m.username}</span><span></span></div>
                 <div><span class="k">Password</span>
-                  ${!m.is_windows ? html`<span class="muted" style="font-size:11.5px">key ในไฟล์ handout</span>`
-                  : m.password === null ? html`<span class="muted" style="font-size:11.5px">ยังไม่พร้อม — รอบูต ~4-5 นาทีแล้วกด Refresh</span>`
+                  ${!m.is_windows ? html`<span class="v sans">ใช้ key ใน handout</span><span></span>`
+                  : m.password === null ? html`<span class="v sans">ยังไม่พร้อม (~5 นาทีหลังบูต)</span><span></span>`
                   : revealed[m.user]
-                    ? html`<span class="flex-center-gap"><span class="pw-shown">${m.password}</span>
-                        <button class="btn tiny" onClick=${() => setRevealed({ ...revealed, [m.user]: false })}>ซ่อน</button></span>`
-                    : html`<span class="flex-center-gap"><span class="masked">••••••••</span>
-                        <button class="btn tiny" onClick=${() => setRevealed({ ...revealed, [m.user]: true })}>แสดง</button></span>`}
+                    ? html`<span class="v"><span class="pw-shown">${m.password}</span></span>
+                        <button class="btn tiny" onClick=${() => setRevealed({ ...revealed, [m.user]: false })}>ซ่อน</button>`
+                    : html`<span class="v masked">••••••••</span>
+                        <button class="btn tiny" onClick=${() => setRevealed({ ...revealed, [m.user]: true })}>แสดง</button>`}
                 </div>
               </div>
-              <div class="mac-foot">
-                ${m.handout_ready
-                  ? html`<a href="/api/labs/${labName}/handouts/${m.user}.zip" download>⤓ handout .zip</a>`
-                  : html`<span class="muted" style="font:600 11px var(--mono)">handout ยังไม่พร้อม</span>`}
-                ${lab.status === 'active' && html`<button class="btn tiny" disabled=${busyJob}
-                  title="สร้างเครื่องของคนนี้ใหม่ เครื่องคนอื่นไม่กระทบ"
-                  onClick=${() => doReset(m.user)}>↺ reset</button>`}
+              <div class="foot">
+                <span class="handout">${m.handout_ready
+                  ? html`<a class="btn tiny" href="/api/labs/${labName}/handouts/${m.user}.zip" download>
+                      <${Icon} name="download" />handout</a>`
+                  : html`<span class="muted" style="font-size:12px">handout ยังไม่พร้อม</span>`}</span>
+                ${isActive && html`<button class="btn tiny" disabled=${busyJob}
+                  title="สร้างเครื่องของคนนี้ใหม่ — ข้อมูลในเครื่องหาย เครื่องอื่นไม่กระทบ"
+                  onClick=${() => doReset(m.user)}>reset</button>`}
+                ${isActive && lab.machines.length > 1 && html`<button class="btn tiny danger-text"
+                  disabled=${busyJob} title="ลบเครื่องของคนนี้ เครื่องอื่นไม่กระทบ"
+                  onClick=${() => setRemoving(m)}>ลบ</button>`}
               </div>
-            </div>`)}
+            </article>`;
+          })}
+          ${isActive && html`
+            <button class="badge ghost-add" disabled=${busyJob} onClick=${() => setAddOpen(true)}>
+              <span class="plus">+</span>เพิ่มเครื่อง</button>`}
         </div>`}
+
+      ${isActive && lab.machines.length > 0 && html`
+        <div style="margin-top:28px"><${GuideCard} labName=${labName} disabled=${busyJob} onDone=${load} /></div>`}
+
+      ${removing && html`<${RemoveUserModal} labName=${labName} machine=${removing}
+        onClose=${() => setRemoving(null)} />`}
 
       ${addOpen && html`<${AddUsersModal} labName=${labName}
         existing=${(lab.config && lab.config.users) || lab.machines.map(m => m.user)}
@@ -1351,95 +1568,431 @@ function OrphanScan() {
     </div>`;
 }
 
-function AwsPage({ aws, onAws }) {
-  const [form, setForm] = useState({
-    access_key_id: '', secret_access_key: '', session_token: '',
-    region: 'ap-southeast-1', remember: true,
-  });
+const NEW_SESSION = '__new__';
+const slugify = (s) => (s || '').toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'aws';
+const sessionLoginPath = (s) => `/aws/sso-sessions/${encodeURIComponent(s)}/login`;
+
+// SSO: เลือก session (หรือใส่ start URL ใหม่) → sign in ครั้งเดียว → เลือก account/role จากรายการ
+function AddSsoAccount({ onAdded }) {
+  const [sessions, setSessions] = useState(null);
+  const [session, setSession] = useState('');
+  const [fresh, setFresh] = useState({ name: '', start_url: '', sso_region: 'ap-southeast-1' });
+  const [region, setRegion] = useState('ap-southeast-1');
+  const [accts, setAccts] = useState(null);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [busy, setBusy] = useState(null);
+  const [err, setErr] = useState(null);
+  const [added, setAdded] = useState(null);
+  const [dropSession, setDropSession] = useState(false);
+
+  const loadSessions = (pick) => api('/aws/sso-sessions').then(r => {
+    setSessions(r.sessions);
+    setSession(pick || (r.sessions[0] ? r.sessions[0].name : NEW_SESSION));
+  }).catch(e => setErr(e.message));
+  useEffect(() => { loadSessions(); }, []);
+
+  async function loadAccounts(s) {
+    if (!s || s === NEW_SESSION) { setAccts(null); return; }
+    setBusy('list'); setErr(null); setNeedsLogin(false); setAccts(null);
+    try { setAccts((await api(`/aws/sso-sessions/${encodeURIComponent(s)}/accounts`)).accounts); }
+    catch (e) { if (e.needsLogin) setNeedsLogin(true); else setErr(e.message); }
+    setBusy(null);
+  }
+  useEffect(() => { loadAccounts(session); }, [session]);
+
+  const [sso, startSso] = useSsoLogin(() => loadAccounts(session), sessionLoginPath);
+
+  async function createSession(e) {
+    e.preventDefault();
+    setBusy('new'); setErr(null);
+    const name = slugify(fresh.name);
+    try {
+      await api('/aws/sso-sessions', { method: 'POST', body: JSON.stringify({ ...fresh, name }) });
+      await loadSessions(name);          // useEffect จะลองดึง account → 409 → แสดงปุ่ม sign in
+      startSso(name);                    // sign in เริ่มแล้วที่ backend — ตัวนี้ตามสถานะ
+    } catch (ex) { setErr(ex.message); }
+    setBusy(null);
+  }
+
+  async function addProfile(a, role) {
+    const name = slugify(a.roles.length > 1 ? `${a.account_name}-${role.name}` : a.account_name);
+    setBusy(`${a.account_id}/${role.name}`); setErr(null);
+    try {
+      await api(`/aws/sso-sessions/${encodeURIComponent(session)}/profiles`, { method: 'POST',
+        body: JSON.stringify({ name, account_id: a.account_id, role_name: role.name, region }) });
+      setAdded(name);
+      onAdded();
+      loadAccounts(session);
+    } catch (ex) { setErr(ex.message); }
+    setBusy(null);
+  }
+
+  if (!sessions) return html`<div class="muted">${err || 'กำลังอ่าน ~/.aws/config…'}</div>`;
+  return html`
+    <div class="row">
+      <div class="field"><label for="ss">SSO login</label>
+        <select id="ss" value=${session} onChange=${(e) => setSession(e.target.value)}>
+          ${sessions.map(s => html`<option value=${s.name} key=${s.name}>${s.name} · ${s.start_url}</option>`)}
+          <option value=${NEW_SESSION}>+ SSO ใหม่ (ใส่ start URL)</option>
+        </select></div>
+      <div class="field" style="flex:0 0 200px; min-width:180px"><label for="rg2">Region ที่ใช้สร้าง lab</label>
+        <input id="rg2" class="mono" type="text" value=${region} onInput=${(e) => setRegion(e.target.value)} /></div>
+    </div>
+
+    ${session === NEW_SESSION && html`
+      <form onSubmit=${createSession}>
+        <div class="row">
+          <div class="field"><label for="sn">ชื่อเรียก <span class="req">*</span></label>
+            <input id="sn" class="mono" type="text" value=${fresh.name} placeholder="my-org"
+              onInput=${(e) => setFresh({ ...fresh, name: e.target.value })} /></div>
+          <div class="field" style="flex:0 0 200px; min-width:180px"><label for="sr2">SSO region</label>
+            <input id="sr2" class="mono" type="text" value=${fresh.sso_region}
+              onInput=${(e) => setFresh({ ...fresh, sso_region: e.target.value })} /></div>
+        </div>
+        <div class="field"><label for="su2">SSO start URL <span class="req">*</span></label>
+          <input id="su2" class="mono" type="text" value=${fresh.start_url} placeholder="https://my-org.awsapps.com/start"
+            onInput=${(e) => setFresh({ ...fresh, start_url: e.target.value })} />
+          <div class="help">หาได้จากหน้า AWS access portal ที่ใช้ login ปกติ</div></div>
+        <div class="btnbar" style="margin-top:4px">
+          <button type="submit" class="btn primary" disabled=${busy === 'new' || !fresh.name || !fresh.start_url.startsWith('https://')}>
+            ${busy === 'new' ? 'กำลังบันทึก…' : 'บันทึกแล้ว sign in'}</button>
+        </div>
+      </form>`}
+
+    ${(() => {
+      const cur = sessions.find(x => x.name === session);
+      return cur && cur.profiles.length === 0 && html`
+        <div class="warn-box" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
+          <span>SSO login <span class="mono">${cur.name}</span> ยังไม่มี account ไหนใช้</span>
+          <button class="btn danger small" onClick=${() => setDropSession(true)}>ลบ SSO login นี้</button>
+        </div>`;
+    })()}
+    ${dropSession && html`<${ConfirmModal} title=${`ลบ SSO login ${session}?`} confirmLabel="ลบ SSO login"
+      onClose=${() => setDropSession(false)}
+      onConfirm=${async () => {
+        await api(`/aws/sso-sessions/${encodeURIComponent(session)}`, { method: 'DELETE' });
+        await loadSessions();
+      }}>
+      ลบ start URL นี้ออกจาก ~/.aws/config — เพิ่มกลับได้ด้วย "+ SSO ใหม่"
+    </${ConfirmModal}>`}
+    ${needsLogin && !sso && html`
+      <div class="warn-box" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
+        <span>ต้อง sign in ${session} ก่อนจึงจะเห็นรายการ account</span>
+        <button class="btn primary small" onClick=${() => startSso(session)}>Sign in</button>
+      </div>`}
+    <${SsoWait} st=${sso} />
+    ${busy === 'list' && html`<div class="muted">กำลังดึงรายการ account จาก SSO…</div>`}
+    <${ErrBox} err=${err} />
+    ${added && html`<div class="ok-box">เพิ่ม ${added} และตั้งเป็น account ที่ใช้แล้ว</div>`}
+
+    ${accts && html`
+      <div class="flabel" style="margin-top:6px">Account ที่คุณเข้าได้ (${accts.length})</div>
+      <div class="acct-list" role="list">
+        ${accts.length === 0 && html`<div class="muted">SSO นี้ยังไม่มี account ที่คุณเข้าได้</div>`}
+        ${accts.map(a => html`
+          <div class="acct-row" role="listitem" key=${a.account_id} style="grid-template-columns:minmax(0,1fr) auto">
+            <div style="min-width:0">
+              <div class="nm">${a.account_name || a.account_id}</div>
+              <div class="ds">${[a.account_id, a.email].filter(Boolean).join(' · ')}</div>
+            </div>
+            <div class="btn-row">
+              ${a.roles.map(r => r.profile
+                ? html`<span class="kind using" key=${r.name} title=${r.name}>มีแล้ว · ${r.profile}</span>`
+                : html`<button class="btn ghost small" key=${r.name} disabled=${!!busy}
+                    onClick=${() => addProfile(a, r)}>${busy === `${a.account_id}/${r.name}` ? 'กำลังเพิ่ม…' : `เพิ่ม · ${r.name}`}</button>`)}
+            </div>
+          </div>`)}
+      </div>`}`;
+}
+
+function AddKeysAccount({ onAdded }) {
+  const [f, setF] = useState({ name: '', region: 'ap-southeast-1', access_key_id: '', secret_access_key: '', session_token: '' });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
   async function submit(e) {
     e.preventDefault();
     setBusy(true); setErr(null);
     try {
-      const res = await api('/aws/login', {
-        method: 'POST',
-        body: JSON.stringify({
-          access_key_id: form.access_key_id,
-          secret_access_key: form.secret_access_key,
-          session_token: form.session_token || null,
-          region: form.region || null,
-          remember: form.remember,
-        }),
-      });
-      onAws(res);
+      await api('/aws/accounts/keys', { method: 'POST', body: JSON.stringify({
+        name: f.name, access_key_id: f.access_key_id, secret_access_key: f.secret_access_key,
+        session_token: f.session_token || null, region: f.region }) });
+      setF({ ...f, access_key_id: '', secret_access_key: '', session_token: '' });
+      onAdded();
     } catch (ex) { setErr(ex.message); }
     setBusy(false);
   }
 
-  if (aws?.connected) {
-    return html`
-      <div class="screen" style="max-width:720px">
-        <h1 class="page-title" style="margin-bottom:16px">เชื่อมต่อ AWS แล้ว</h1>
-        <div class="card">
-          <div class="kv-rows">
-            <div class="kv-row"><span class="k">Account</span><span class="v">${aws.account}</span></div>
-            <div class="kv-row"><span class="k">Identity</span><span class="v">${aws.arn || '-'}</span></div>
-            <div class="kv-row"><span class="k">Region</span><span class="v">${aws.region || '-'}</span></div>
-            <div class="kv-row"><span class="k">ที่มา</span><span class="v sans">
-              ${aws.method === 'env' ? 'ใส่ผ่านหน้านี้ (จำเฉพาะ session นี้)'
-                : aws.method?.startsWith('profile:') ? `โปรไฟล์ ${aws.method.slice(8)} ใน ~/.aws/credentials — ครั้งหน้าไม่ต้องใส่ใหม่`
-                : aws.method || '-'}</span></div>
-          </div>
-          <div class="btnbar">
-            <button class="btn ghost" onClick=${() => nav('/')}>← หน้าแรก</button>
-            <button class="btn primary" onClick=${() => { PREFILL = null; nav('/new'); }}>สร้าง hands-on lab ได้เลย →</button>
-          </div>
+  return html`
+    <form onSubmit=${submit}>
+      <div class="row">
+        <div class="field"><label for="an">ชื่อ account <span class="req">*</span></label>
+          <input id="an" class="mono" type="text" value=${f.name} onInput=${set('name')} placeholder="customer-poc" /></div>
+        <div class="field"><label for="ar">Region ที่ใช้สร้าง lab</label>
+          <input id="ar" class="mono" type="text" value=${f.region} onInput=${set('region')} /></div>
+      </div>
+      <div class="field"><label for="ak">Access Key ID <span class="req">*</span></label>
+        <input id="ak" class="mono" type="text" value=${f.access_key_id} onInput=${set('access_key_id')} placeholder="AKIA… หรือ ASIA…" autocomplete="off" /></div>
+      <div class="field"><label for="sk">Secret Access Key <span class="req">*</span></label>
+        <input id="sk" type="password" value=${f.secret_access_key} onInput=${set('secret_access_key')} autocomplete="off" /></div>
+      <div class="field"><label for="st">Session token <span class="opt">— เฉพาะคีย์ชั่วคราว (ขึ้นต้น ASIA)</span></label>
+        <input id="st" type="password" value=${f.session_token} onInput=${set('session_token')} autocomplete="off" /></div>
+      <${ErrBox} err=${err} />
+      <div class="btnbar">
+        <button type="submit" class="btn primary" disabled=${busy || !f.name || !f.access_key_id || !f.secret_access_key}>
+          ${busy ? 'กำลังตรวจ…' : 'ตรวจแล้วบันทึก'}</button>
+      </div>
+    </form>`;
+}
+
+function ConfirmModal({ title, children, confirmLabel, onConfirm, onClose }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && !busy) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+  async function go() {
+    setBusy(true); setErr(null);
+    try { await onConfirm(); onClose(); } catch (e) { setErr(e.message); setBusy(false); }
+  }
+  return html`
+    <div class="modal-overlay" onClick=${(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+      <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="cf-title">
+        <div id="cf-title" class="modal-title">${title}</div>
+        <div class="modal-sub" style="margin-bottom:0">${children}</div>
+        <${ErrBox} err=${err} />
+        <div class="modal-actions">
+          <button class="btn ghost" disabled=${busy} onClick=${onClose} autofocus>ยกเลิก</button>
+          <button class="btn danger solid" disabled=${busy} onClick=${go}>${busy ? 'กำลังลบ…' : confirmLabel}</button>
         </div>
-        <${OrphanScan} />
-      </div>`;
+      </div>
+    </div>`;
+}
+
+function AddAccount({ onAdded }) {
+  const [kind, setKind] = useState('sso');
+  return html`
+    <section class="card" style="margin-top:18px">
+      <h2 class="section-title">เพิ่ม account</h2>
+      <div class="seg" role="tablist" aria-label="ประเภท account">
+        <button type="button" role="tab" aria-selected=${kind === 'sso'} class=${kind === 'sso' ? 'on' : ''}
+          onClick=${() => setKind('sso')}>SSO (แนะนำ)</button>
+        <button type="button" role="tab" aria-selected=${kind === 'keys'} class=${kind === 'keys' ? 'on' : ''}
+          onClick=${() => setKind('keys')}>Access key</button>
+      </div>
+      <p class="help" style="margin:0 0 16px">${kind === 'sso'
+        ? 'sign in SSO ครั้งเดียว แล้วเลือก account กับ role จากรายการ — labctl เขียนโปรไฟล์ลง ~/.aws/config ให้ หมดอายุก็กด sign in ใหม่'
+        : 'ตรวจกับ AWS ก่อน แล้วบันทึกเป็นโปรไฟล์ใน ~/.aws/credentials (เฉพาะชื่อนี้ — โปรไฟล์อื่นไม่ถูกแตะ)'}</p>
+      ${kind === 'sso' ? html`<${AddSsoAccount} onAdded=${onAdded} />` : html`<${AddKeysAccount} onAdded=${onAdded} />`}
+    </section>`;
+}
+
+function RetireAccountModal({ account, onClose, onDone }) {
+  const hasLabs = account.labs.length > 0;
+  const [destroyLabs, setDestroyLabs] = useState(false);
+  const [signOut, setSignOut] = useState(account.kind === 'sso');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const blocked = hasLabs && !destroyLabs;
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && !busy) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
+  async function go() {
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/aws/accounts/${encodeURIComponent(account.name)}/retire`, {
+        method: 'POST', body: JSON.stringify({ destroy_labs: destroyLabs, sign_out: signOut }) });
+      onDone(r);
+      const first = r.destroy_jobs[0];
+      nav(first ? `/job/${first.job_id}?lab=${first.lab_name}` : `/job/${r.retire_job}?lab=account:${account.name}`);
+    } catch (e) { setErr(e.message); setBusy(false); }
   }
 
   return html`
-    <div class="screen" style="max-width:720px">
-      <h1 class="page-title" style="margin-bottom:16px">เชื่อมต่อ AWS</h1>
-      <div class="card">
-        <p class="page-sub" style="margin-top:0">
-          ใส่ Access Key ของบัญชี AWS ที่มีสิทธิ์ EC2 + VPC — ระบบตรวจกับ AWS (STS) ก่อนใช้จริง
-          key ไม่ถูกส่งไปที่อื่นนอกจาก AWS และไม่ลง log</p>
-        ${aws?.reason && !err && html`<div class="err">${aws.reason}</div>`}
+    <div class="modal-overlay" onClick=${(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+      <div class="modal" style="width:500px" role="alertdialog" aria-modal="true" aria-labelledby="ra-title">
+        <div id="ra-title" class="modal-title">ลบ account <span class="mono">${account.name}</span></div>
+        <div class="modal-sub">${account.account_id ? html`<span class="mono">${account.account_id}</span> · ` : ''}
+          ลบโปรไฟล์ออกจาก ~/.aws (สำรองไว้ที่ ~/.aws/*.labctl-bak) แล้วเลือกได้ว่าจะเก็บกวาดบน AWS ด้วยไหม</div>
+        ${hasLabs && html`
+          <label class="checkbox" style="margin-bottom:12px">
+            <input type="checkbox" checked=${destroyLabs} onChange=${(e) => setDestroyLabs(e.target.checked)} />
+            <span><b>Destroy lab ใน account นี้ก่อน (${account.labs.length})</b> — ${account.labs.join(', ')}<br />
+              <span class="help">VM, VPC และ key ทั้งหมดถูกลบถาวร — ไม่มีอะไรค้างคิดเงิน</span></span>
+          </label>`}
+        ${account.kind === 'sso' && html`
+          <label class="checkbox">
+            <input type="checkbox" checked=${signOut} onChange=${(e) => setSignOut(e.target.checked)} />
+            <span><b>Sign out SSO</b> — เพิกถอน token ของเครื่องนี้กับ AWS และลบ cache
+              <br /><span class="help">ถ้ายังมี account อื่นใช้ SSO login เดียวกัน จะข้ามขั้นนี้ให้เอง</span></span>
+          </label>`}
+        ${blocked && html`<div class="help bad" style="margin-top:12px">ต้อง destroy lab ก่อน — ไม่งั้นจะไม่เหลือ account ไว้ลบ lab เหล่านั้น</div>`}
         <${ErrBox} err=${err} />
-        <form onSubmit=${submit}>
-          <div class="field"><label>Access Key ID <span class="req">*</span></label>
-            <input type="text" value=${form.access_key_id} onInput=${set('access_key_id')}
-              placeholder="AKIA…" autocomplete="off" /></div>
-          <div class="field"><label>Secret Access Key <span class="req">*</span></label>
-            <input type="password" value=${form.secret_access_key} onInput=${set('secret_access_key')} autocomplete="off" /></div>
-          <div class="row">
-            <div class="field"><label>Session Token <span class="opt">optional — เฉพาะ credential ชั่วคราว (SSO/STS)</span></label>
-              <input type="password" value=${form.session_token} onInput=${set('session_token')} autocomplete="off" /></div>
-            <div class="field"><label>Default region</label>
-              <input type="text" value=${form.region} onInput=${set('region')} /></div>
-          </div>
-          <div class="field"><label class="checkbox">
-            <input type="checkbox" checked=${form.remember}
-              onChange=${(e) => setForm({ ...form, remember: e.target.checked })} />
-            จำไว้ในเครื่องนี้ (~/.aws/credentials โปรไฟล์ labctl) — ปิดโปรแกรมแล้วไม่ต้องใส่ใหม่
-          </label>
-          ${!form.remember && html`<div class="help bad">
-            ไม่จำ = คีย์อยู่แค่ในหน่วยความจำของ server ตัวนี้ — หายทุกครั้งที่ปิด/restart
-            และคำสั่ง <span class="mono">labctl.py</span> ที่รันแยกจะมองไม่เห็นคีย์นี้</div>`}
-          </div>
-          <div class="btnbar">
-            <button type="button" class="btn ghost" onClick=${() => nav('/')}>ยกเลิก</button>
-            <button type="submit" class="btn primary"
-              disabled=${busy || !form.access_key_id || !form.secret_access_key}>
-              ${busy ? 'กำลังตรวจกับ AWS…' : 'เชื่อมต่อ'}</button>
-          </div>
-        </form>
+        <div class="modal-actions">
+          <button class="btn ghost" disabled=${busy} onClick=${onClose} autofocus>ยกเลิก</button>
+          <button class="btn danger solid" disabled=${busy || blocked} onClick=${go}>
+            ${busy ? 'กำลังเริ่ม…' : hasLabs ? `Destroy ${account.labs.length} lab แล้วลบ account` : 'ลบ account'}</button>
+        </div>
       </div>
+    </div>`;
+}
+
+// งานระดับ organization — ใช้ได้เฉพาะโปรไฟล์ของ management account และย้อนไม่ได้
+function OrgDangerZone({ accounts }) {
+  const sso = accounts.filter(a => a.kind === 'sso' && a.account_id);
+  const [f, setF] = useState({ action: 'remove-access', admin_profile: '', account_id: '', permission_set: '', user_name: '', confirm: '' });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [done, setDone] = useState(null);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value, ...(k !== 'confirm' ? { confirm: '' } : {}) });
+
+  function pickTarget(e) {
+    const a = sso.find(x => x.account_id === e.target.value);
+    setF({ ...f, account_id: e.target.value, permission_set: a?.role || f.permission_set, confirm: '' });
+  }
+
+  async function go(e) {
+    e.preventDefault();
+    setBusy(true); setErr(null); setDone(null);
+    try {
+      const r = await api(`/aws/org/${f.action}`, { method: 'POST', body: JSON.stringify(f) });
+      setDone(f.action === 'close-account'
+        ? `ส่งคำสั่งปิด account ${r.account_id} แล้ว — สถานะ ${r.status} (AWS ลบถาวรหลัง 90 วัน)`
+        : `ถอนสิทธิ์ ${r.permission_set} ของ ${r.user} ออกจาก ${r.account_id} แล้ว (${r.status || 'ส่งคำสั่งแล้ว'})`);
+      setF({ ...f, confirm: '' });
+    } catch (ex) { setErr(ex.message); }
+    setBusy(false);
+  }
+
+  const ready = f.admin_profile && /^\d{12}$/.test(f.account_id) && f.confirm === f.account_id
+    && (f.action === 'close-account' || (f.permission_set && f.user_name));
+
+  return html`
+    <details class="card" style="margin-top:18px; border-color:color-mix(in srgb, var(--crit) 40%, var(--border))">
+      <summary style="color:var(--crit)">Danger zone — ถอนสิทธิ์ SSO / ปิด AWS account</summary>
+      <form onSubmit=${go} style="margin-top:14px">
+        <p class="help" style="margin:0 0 14px">มีผลกับทั้ง organization และย้อนไม่ได้ ต้องใช้โปรไฟล์ของ <b>management account</b>
+          (หรือ delegated admin ของ IAM Identity Center) — ไม่ใช่ account ที่จะถูกปิด</p>
+        <div class="seg" role="tablist">
+          <button type="button" role="tab" aria-selected=${f.action === 'remove-access'} class=${f.action === 'remove-access' ? 'on' : ''}
+            onClick=${() => setF({ ...f, action: 'remove-access', confirm: '' })}>ถอนสิทธิ์ผู้ใช้</button>
+          <button type="button" role="tab" aria-selected=${f.action === 'close-account'} class=${f.action === 'close-account' ? 'on' : ''}
+            onClick=${() => setF({ ...f, action: 'close-account', confirm: '' })}>ปิด AWS account</button>
+        </div>
+        <div class="row">
+          <div class="field"><label for="adm">โปรไฟล์ management account <span class="req">*</span></label>
+            <select id="adm" value=${f.admin_profile} onChange=${set('admin_profile')}>
+              <option value="">— เลือก —</option>
+              ${accounts.map(a => html`<option value=${a.name} key=${a.name}>${a.name}${a.account_id ? ` · ${a.account_id}` : ''}</option>`)}
+            </select></div>
+          <div class="field"><label for="tgt">Account เป้าหมาย <span class="req">*</span></label>
+            <select id="tgt" value=${f.account_id} onChange=${pickTarget}>
+              <option value="">— เลือก —</option>
+              ${[...new Set(sso.map(a => a.account_id))].map(id => html`<option value=${id} key=${id}>${id} · ${sso.filter(a => a.account_id === id).map(a => a.name).join(', ')}</option>`)}
+            </select></div>
+        </div>
+        ${f.action === 'remove-access' && html`
+          <div class="row">
+            <div class="field"><label for="psn">Permission set <span class="req">*</span></label>
+              <input id="psn" class="mono" type="text" value=${f.permission_set} onInput=${set('permission_set')} /></div>
+            <div class="field"><label for="un">Username ใน Identity Center <span class="req">*</span></label>
+              <input id="un" class="mono" type="text" value=${f.user_name} onInput=${set('user_name')} placeholder="name@company.com" /></div>
+          </div>`}
+        ${f.action === 'close-account' && html`<div class="warn-box">ปิดแล้ว account เข้าใช้ไม่ได้ทันที — กู้คืนได้ภายใน 90 วันผ่าน AWS Support เท่านั้น จากนั้นลบถาวร</div>`}
+        <div class="field"><label for="cf">พิมพ์ account ID เพื่อยืนยัน</label>
+          <input id="cf" class="mono" type="text" value=${f.confirm} onInput=${set('confirm')} placeholder=${f.account_id || '123456789012'} /></div>
+        <${ErrBox} err=${err} />
+        ${done && html`<div class="ok-box">${done}</div>`}
+        <div class="btnbar">
+          <button type="submit" class="btn danger solid" disabled=${busy || !ready}>
+            ${busy ? 'กำลังส่งคำสั่ง…' : f.action === 'close-account' ? 'ปิด AWS account' : 'ถอนสิทธิ์'}</button>
+        </div>
+      </form>
+    </details>`;
+}
+
+function AwsPage({ aws, onAws }) {
+  const [list, setList] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const refresh = () => api('/aws/accounts').then(setList).catch(e => setErr(e.message));
+  useEffect(() => { refresh(); }, []);
+  const reloadStatus = async () => { onAws(await api('/aws/status?force=true')); refresh(); };
+  const [sso, startSso] = useSsoLogin(() => reloadStatus());
+
+  async function use(a) {
+    setBusy(a.name); setErr(null);
+    try {
+      const st = await api('/aws/accounts/select', { method: 'POST', body: JSON.stringify({ profile: a.name }) });
+      onAws(st);
+      if (st.needs_login) startSso(a.name);
+    } catch (e) {
+      // SSO ที่หมดอายุ: ตั้งเป็นตัวที่ใช้แล้ว แต่ต้อง sign in ก่อน — เริ่มให้เลย
+      if (e.needsLogin) startSso(a.name);
+      else setErr(e.message);
+    }
+    setBusy(null);
+    refresh();
+    try { onAws(await api('/aws/status?force=true')); } catch (e2) { /* noop */ }
+  }
+
+  const [removing, setRemoving] = useState(null);
+
+  return html`
+    <div class="screen" style="max-width:860px">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">AWS accounts</h1>
+          <div class="page-sub">อ่านจากโปรไฟล์ใน ~/.aws — lab ใหม่สร้างใน account ที่เลือก ส่วน lab เดิมยังใช้ account ที่สร้างมันเสมอ</div>
+        </div>
+      </div>
+      <div class="card">
+        ${!list && html`<div class="muted">${err || 'กำลังอ่าน ~/.aws…'}</div>`}
+        ${list && list.accounts.length === 0 && html`<div class="muted">ยังไม่มีโปรไฟล์ AWS ในเครื่องนี้ — เพิ่มด้านล่าง</div>`}
+        ${list && html`<div class="acct-list" role="list">
+          ${list.accounts.map(a => {
+            const isActive = a.name === (aws?.profile || list.active);
+            const live = isActive && aws?.connected;
+            return html`
+            <div class="acct-row ${isActive ? 'active' : ''}" role="listitem" key=${a.name}>
+              <span class="mark" aria-hidden="true"></span>
+              <div style="min-width:0">
+                <div class="nm">${a.name}
+                  <span class="kind ${a.kind}">${a.kind === 'sso' ? 'SSO' : a.temporary ? 'คีย์ชั่วคราว' : 'Access key'}</span>
+                  ${isActive && html`<span class="kind using">${live ? 'ใช้อยู่' : aws?.needs_login ? 'ใช้อยู่ · ต้อง sign in' : 'ใช้อยู่ · ใช้ไม่ได้'}</span>`}</div>
+                <div class="ds">${[live ? aws.account : a.account_id, a.role, a.region].filter(Boolean).join(' · ') || '—'}</div>
+                ${a.labs.length > 0 && html`<div class="help">lab ที่ใช้อยู่: ${a.labs.join(', ')}</div>`}
+                ${isActive && !live && aws?.reason && !aws?.needs_login && html`<div class="help bad">${aws.reason}</div>`}
+              </div>
+              <div class="btn-row">
+                ${a.kind === 'sso' && html`<button class="btn ghost small" disabled=${sso?.state === 'waiting'}
+                  onClick=${() => startSso(a.name)}>Sign in</button>`}
+                ${!isActive && html`<button class="btn primary small" disabled=${busy === a.name}
+                  onClick=${() => use(a)}>${busy === a.name ? 'กำลังตรวจ…' : 'ใช้ account นี้'}</button>`}
+                ${a.removable && html`<button class="btn tiny danger-text"
+                  title="ลบ account นี้ — เลือก destroy lab และ sign out SSO ได้"
+                  onClick=${() => setRemoving(a)}>ลบ</button>`}
+              </div>
+            </div>`;
+          })}
+        </div>`}
+        <${SsoWait} st=${sso} />
+        <${ErrBox} err=${list ? err : null} />
+        ${aws?.connected && html`<div class="btnbar">
+          <button class="btn primary" onClick=${() => { PREFILL = null; nav('/new'); }}>สร้าง lab ใน ${aws.profile || aws.account} →</button>
+        </div>`}
+      </div>
+      <${AddAccount} key=${(list?.accounts || []).map(a => a.name).join(',')} onAdded=${reloadStatus} />
+      ${removing && html`<${RetireAccountModal} account=${removing}
+        onClose=${() => setRemoving(null)} onDone=${() => setRemoving(null)} />`}
+      ${list && html`<${OrgDangerZone} accounts=${list.accounts} />`}
+      <${OrphanScan} />
     </div>`;
 }
 
@@ -1455,7 +2008,13 @@ function Shell({ onLogout }) {
   const [theme, setTheme] = useState(document.body.dataset.theme || 'light');
 
   useEffect(() => {
-    const load = () => api('/labs').then(d => { setLabs(d.labs); setLabsLoaded(true); }).catch(() => {});
+    let first = true;
+    const load = () => api('/labs').then(d => {
+      setLabs(d.labs); setLabsLoaded(true);
+      // เข้ามาครั้งแรกแล้วยังไม่มี lab ที่รันอยู่ = มาเพื่อสร้างเครื่อง — พาไปหน้าสร้างเลย
+      if (first && !d.labs.some(l => l.status !== 'destroyed') && ['', '/'].includes(location.hash.slice(1))) nav('/new');
+      first = false;
+    }).catch(() => {});
     load();
     const t = setInterval(load, 8000);
     return () => clearInterval(t);
@@ -1481,7 +2040,7 @@ function Shell({ onLogout }) {
   let screen;
   const jobMatch = route.match(/^\/job\/([^?]+)\?lab=(.+)$/);
   const labMatch = route.match(/^\/lab\/(.+)$/);
-  if (route === '/new') screen = html`<${Wizard} aws=${aws} />`;
+  if (route === '/new') screen = html`<${Wizard} aws=${aws} onAws=${setAws} />`;
   else if (route === '/aws') screen = html`<${AwsPage} aws=${aws} onAws=${setAws} />`;
   else if (jobMatch) screen = html`<${JobView} jobId=${jobMatch[1]} labName=${decodeURIComponent(jobMatch[2])} />`;
   else if (labMatch) screen = html`<${Dashboard} labName=${decodeURIComponent(labMatch[1])} />`;

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import labctl
-from . import auth, aws, db, jobs
+from . import accounts, auth, aws, db, jobs, orgadmin
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -164,6 +164,291 @@ class AwsLoginBody(BaseModel):
     remember: bool = True
 
 
+# ---------------------------------------------------------------------------
+# AWS accounts — โปรไฟล์ใน ~/.aws ที่ labctl จำไว้ (SSO ก่อน, คีย์เป็นทางสำรอง)
+# ---------------------------------------------------------------------------
+
+def _account_error(e):
+    return HTTPException(409 if e.needs_login else 400,
+                         {"message": str(e), "needs_login": e.needs_login})
+
+
+def _labs_by_profile():
+    """profile → lab ที่ยังไม่ถูกลบซึ่งผูกกับ profile นั้น (ลบ account ที่ยังมี lab = ลบ lab ไม่ได้อีก)"""
+    out = {}
+    for r in db.list_labs():
+        if r["status"] == "destroyed":
+            continue
+        prof = json.loads(r.get("config_json") or "{}").get("aws_profile")
+        if prof:
+            out.setdefault(prof, []).append(r["lab_name"])
+    return out
+
+
+@app.get("/api/aws/accounts")
+def api_accounts():
+    in_use = _labs_by_profile()
+    return {"accounts": [{**p, "labs": in_use.get(p["name"], []),
+                          "removable": accounts.removable(p)} for p in accounts.list_profiles()],
+            "active": accounts.active_profile()}
+
+
+class SelectAccountBody(BaseModel):
+    profile: str
+
+
+@app.post("/api/aws/accounts/select")
+def api_select_account(body: SelectAccountBody):
+    """สลับ account — ยืนยันกับ STS ก่อน ถ้า SSO หมดอายุบอกให้ sign in (409)"""
+    try:
+        accounts.get_profile(body.profile)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    previous = accounts.active_profile()
+    accounts.set_active(body.profile)
+    aws.reset_caches()
+    st = aws.status(force=True)
+    if not st.get("connected") and not st.get("needs_login"):
+        # คีย์เสีย — กลับไปใช้ตัวเดิม ไม่ทิ้งผู้ใช้ไว้กับ account ที่ใช้ไม่ได้
+        if previous:
+            accounts.set_active(previous)
+            aws.reset_caches()
+        raise HTTPException(400, {"message": st.get("reason", "ใช้ account นี้ไม่ได้"), "needs_login": False})
+    return st
+
+
+@app.post("/api/aws/accounts/{profile}/sso-login")
+def api_sso_login(profile: str):
+    try:
+        return accounts.start_sso_login(profile)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+@app.get("/api/aws/accounts/{profile}/sso-login")
+def api_sso_login_status(profile: str):
+    st = accounts.login_status(profile)
+    if st.get("state") == "done":
+        aws.reset_caches()
+    return st
+
+
+class AddKeysAccountBody(BaseModel):
+    name: str
+    access_key_id: str
+    secret_access_key: str
+    session_token: Optional[str] = None
+    region: Optional[str] = None
+
+
+@app.post("/api/aws/accounts/keys")
+def api_add_keys_account(body: AddKeysAccountBody):
+    key, secret = body.access_key_id.strip(), body.secret_access_key.strip()
+    token = (body.session_token or "").strip() or None
+    region = (body.region or "").strip() or aws.DEFAULT_REGION
+    if not key or not secret:
+        raise HTTPException(400, {"message": "ต้องใส่ทั้ง Access Key ID และ Secret Access Key"})
+    try:
+        ident = aws.sts_get_caller_identity(key, secret, token)   # ตรวจก่อนเขียนลงดิสก์
+        accounts.add_keys_profile(body.name.strip(), key, secret, token, region)
+    except aws.AwsError as e:
+        raise HTTPException(400, {"message": str(e)})
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    accounts.set_active(body.name.strip())
+    aws.reset_caches()
+    return {"profile": body.name.strip(), "account": ident["account"], "arn": ident["arn"]}
+
+
+class AddSsoAccountBody(BaseModel):
+    name: str
+    start_url: str
+    sso_region: str = "ap-southeast-1"
+    account_id: str
+    role_name: str
+    region: str = "ap-southeast-1"
+
+
+@app.post("/api/aws/accounts/sso")
+def api_add_sso_account(body: AddSsoAccountBody):
+    name = body.name.strip()
+    try:
+        accounts.add_sso_profile(name, body.start_url.strip(), body.sso_region.strip(),
+                                 body.account_id.strip(), body.role_name.strip(),
+                                 body.region.strip())
+        accounts.set_active(name)
+        aws.reset_caches()
+        return accounts.start_sso_login(name)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+class RetireAccountBody(BaseModel):
+    destroy_labs: bool = False
+    sign_out: bool = True
+
+
+@app.post("/api/aws/accounts/{profile}/retire", status_code=202)
+def api_retire_account(profile: str, body: RetireAccountBody):
+    """ลบ account ให้จบ: destroy lab ทุกตัวใน account นี้ → sign out SSO → ลบโปรไฟล์
+    ทุกขั้นเป็น job ในคิวเดียวกัน (ทำทีละงาน) จึงลบโปรไฟล์หลัง destroy ครบแน่นอน"""
+    try:
+        prof = accounts.get_profile(profile)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    if not accounts.removable(prof):
+        raise HTTPException(400, {"message": f"'{profile}' เป็นคีย์ที่ไม่ได้ใส่ผ่าน labctl — ลบเองใน ~/.aws"})
+    labs = _labs_by_profile().get(profile, [])
+    if labs and not body.destroy_labs:
+        raise HTTPException(409, {"message": f"ยังมี lab ใน account นี้: {', '.join(labs)} — "
+                                             "เลือก destroy lab ด้วย หรือ destroy เองก่อน"})
+    if labs:
+        try:
+            with aws.using_profile(profile):
+                aws.resolve_verified()
+        except aws.AwsError as e:
+            raise HTTPException(409 if e.code == "NeedsLogin" else 400,
+                                {"message": f"ต้องใช้ account นี้ได้ก่อนจึงจะ destroy lab ได้: {e}",
+                                 "needs_login": e.code == "NeedsLogin"})
+    destroy_jobs = []
+    for lab in labs:
+        cfg = _prepared_cfg(lab)
+        destroy_jobs.append({"lab_name": lab, "job_id": jobs.enqueue("destroy", cfg)})
+    retire_job = jobs.enqueue("retire_account", {"lab_name": f"account:{profile}",
+                                                 "_profile": profile, "_sign_out": body.sign_out})
+    return {"profile": profile, "destroy_jobs": destroy_jobs, "retire_job": retire_job}
+
+
+class OrgActionBody(BaseModel):
+    admin_profile: str
+    account_id: str
+    confirm: str
+    permission_set: Optional[str] = None
+    user_name: Optional[str] = None
+
+
+def _check_org_body(body):
+    if body.confirm.strip() != body.account_id.strip():
+        raise HTTPException(400, {"message": "พิมพ์ account ID ให้ตรงเพื่อยืนยัน"})
+    in_use = [lab for prof, labs in _labs_by_profile().items()
+              for lab in labs if (_account_of(prof) == body.account_id.strip())]
+    if in_use:
+        raise HTTPException(409, {"message": f"ยังมี lab ใน account นี้: {', '.join(in_use)} — destroy ก่อน"})
+
+
+def _account_of(profile):
+    try:
+        return accounts.get_profile(profile).get("account_id")
+    except accounts.AccountError:
+        return None
+
+
+@app.post("/api/aws/org/close-account")
+def api_close_account(body: OrgActionBody):
+    _check_org_body(body)
+    try:
+        return orgadmin.close_account(body.admin_profile, body.account_id.strip())
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+@app.post("/api/aws/org/remove-access")
+def api_remove_access(body: OrgActionBody):
+    _check_org_body(body)
+    if not body.permission_set or not body.user_name:
+        raise HTTPException(400, {"message": "ต้องระบุ permission set และ username ใน Identity Center"})
+    try:
+        return orgadmin.remove_access(body.admin_profile, body.account_id.strip(),
+                                      body.permission_set, body.user_name)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+@app.get("/api/aws/sso-sessions")
+def api_sso_sessions():
+    return {"sessions": accounts.list_sso_sessions()}
+
+
+class SsoSessionBody(BaseModel):
+    name: str
+    start_url: str
+    sso_region: str = "ap-southeast-1"
+
+
+@app.post("/api/aws/sso-sessions")
+def api_add_sso_session(body: SsoSessionBody):
+    """SSO ใหม่: บันทึก start URL แล้วเริ่ม sign in — เลือก account/role ทีหลังจากรายการ"""
+    name = body.name.strip()
+    try:
+        accounts.add_sso_session(name, body.start_url.strip(), body.sso_region.strip())
+        return accounts.start_sso_login(name, session=True)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+@app.post("/api/aws/sso-sessions/{session}/login")
+def api_session_login(session: str):
+    try:
+        return accounts.start_sso_login(session, session=True)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+@app.get("/api/aws/sso-sessions/{session}/login")
+def api_session_login_status(session: str):
+    return accounts.login_status("session:" + session)
+
+
+@app.delete("/api/aws/sso-sessions/{session}")
+def api_remove_sso_session(session: str):
+    try:
+        accounts.remove_sso_session(session)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    return {"removed": session}
+
+
+@app.get("/api/aws/sso-sessions/{session}/accounts")
+def api_session_accounts(session: str):
+    try:
+        return {"accounts": accounts.list_sso_accounts(session)}
+    except accounts.AccountError as e:
+        raise _account_error(e)
+
+
+class ProfileFromSessionBody(BaseModel):
+    name: str
+    account_id: str
+    role_name: str
+    region: str = "ap-southeast-1"
+
+
+@app.post("/api/aws/sso-sessions/{session}/profiles")
+def api_profile_from_session(session: str, body: ProfileFromSessionBody):
+    name = body.name.strip()
+    try:
+        accounts.add_profile_from_session(name, session, body.account_id.strip(),
+                                          body.role_name.strip(), body.region.strip())
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    accounts.set_active(name)
+    aws.reset_caches()
+    return aws.status(force=True)
+
+
+@app.delete("/api/aws/accounts/{profile}")
+def api_remove_account(profile: str):
+    in_use = _labs_by_profile().get(profile, [])
+    if in_use:
+        raise HTTPException(409, {"message": f"ยังมี lab ที่ใช้ account นี้อยู่: {', '.join(in_use)} — destroy ก่อน"})
+    try:
+        accounts.remove_profile(profile)
+    except accounts.AccountError as e:
+        raise _account_error(e)
+    aws.reset_caches()
+    return {"removed": profile}
+
+
 @app.post("/api/aws/login")
 def api_aws_login(body: AwsLoginBody):
     try:
@@ -242,9 +527,9 @@ def api_labs():
             "config_json": None, "_users": len(tfvars.get("users", [])),
         }
     labs = []
+    products = labctl.list_products()     # อ่านไฟล์ product ครั้งเดียว ไม่ใช่ต่อ lab
     for r in sorted(rows.values(), key=lambda x: x["created_at"], reverse=True):
         cfg = json.loads(r["config_json"]) if r.get("config_json") else (_find_config_for(r["lab_name"]) or {})
-        products = labctl.list_products()
         pname = products.get(r["product"], {}).get("product_name") if r.get("product") else None
         prod_meta = products.get(r["product"], {}) if r.get("product") else {}
         job = db.latest_job_for_lab(r["lab_name"])
@@ -257,8 +542,11 @@ def api_labs():
             "status": r["status"],
             "expire_date": r.get("expire_date"),
             "expires_at": r.get("expires_at"),
+            "ttl_hours": r.get("ttl_hours"),
             "os": cfg.get("os") or prod_meta.get("os"),
             "instance_type": cfg.get("instance_type") or prod_meta.get("instance_type"),
+            "aws_profile": cfg.get("aws_profile"),
+            "aws_account": cfg.get("aws_account"),
             "job": {"id": job["id"], "state": job["state"], "kind": job["kind"],
                     "error": job["error"]} if job else None,
         })
@@ -373,9 +661,13 @@ def api_create_lab(body: CreateLabBody):
     # ยืนยันกับ STS เลย ไม่ใช่แค่ดูว่ามีคีย์อยู่ — คีย์ที่หมดอายุจะได้ถูกปัดตกตรงนี้
     # แทนที่จะปล่อยให้ job ไปตายตอน apply แล้วทิ้ง lab สถานะ error ไว้
     try:
-        aws.resolve_verified()
+        creds = aws.resolve_verified()
     except aws.AwsError as e:
         raise HTTPException(400, str(e))
+    # lab ผูกกับ account ที่สร้าง — สลับ account ทีหลังแล้วลบ lab นี้ต้องยังไปถูกที่
+    if creds.get("profile"):
+        cfg["aws_profile"] = creds["profile"]
+    cfg["aws_account"] = creds["account"]
     existing = db.get_lab(cfg["lab_name"])
     if existing and existing["status"] not in ("destroyed", "error"):
         raise HTTPException(409, f"lab '{cfg['lab_name']}' มีอยู่แล้ว (สถานะ {existing['status']})")
@@ -409,6 +701,8 @@ def api_lab_detail(lab_name: str):
         # ปุ่ม "สร้างซ้ำ" ใช้ค่านี้เติมฟอร์ม — ไม่ส่งกลับไปจะกลายเป็น default 8 ทุกครั้ง
         "ttl_hours": (row or {}).get("ttl_hours"),
         "instance_type": (cfg or {}).get("instance_type"),
+        "aws_profile": (cfg or {}).get("aws_profile"),
+        "aws_account": (cfg or {}).get("aws_account"),
         "config": {k: v for k, v in (cfg or {}).items() if not k.startswith("_")} or None,
         "job": db.latest_job_for_lab(lab_name),
         "machines": [],
@@ -654,7 +948,8 @@ def api_power(lab_name: str, body: PowerBody):
     ids = [vm["instance_id"] for vm in outputs["lab_info"].values()]
     cfg = _find_config_for(lab_name) or {}
     try:
-        res = aws.power_instances(ids, body.action, region=cfg.get("region"))
+        with aws.using_profile(cfg.get("aws_profile")):
+            res = aws.power_instances(ids, body.action, region=cfg.get("region"))
     except aws.AwsError as e:
         # spot แบบ one-time หยุดไม่ได้ตามข้อกำหนดของ AWS — เป็นคู่ที่คนเลือกผิดบ่อย
         # (เลือก spot เพื่อประหยัด แล้วอยากหยุดเครื่องข้ามคืนเพื่อประหยัดอีก)
@@ -733,13 +1028,48 @@ def api_add_users(lab_name: str, body: AddUsersBody):
     except labctl.ConfigError as e:
         raise HTTPException(400, str(e))
     try:
-        aws.resolve_verified()
+        with aws.using_profile(stored.get("aws_profile")):
+            aws.resolve_verified()
     except aws.AwsError as e:
         raise HTTPException(400, str(e))
     # บันทึกก่อน apply — ถ้า apply ล้มกลางทาง กดเพิ่ม/Refresh รอบหน้าจะได้ไม่ลบเครื่องที่สร้างไปแล้ว
     db.update_lab_config(lab_name, updated)
     job_id = jobs.enqueue("add_users", {**cfg, "_new_users": new})
     return {"job_id": job_id, "lab_name": lab_name, "users": new}
+
+
+@app.delete("/api/labs/{lab_name}/users/{user}", status_code=202)
+def api_remove_user(lab_name: str, user: str):
+    """ลบเครื่องของผู้เรียนคนเดียว — terraform for_each ลบเฉพาะ resource ของคนนั้น"""
+    row = db.get_lab(lab_name)
+    if not row or not row.get("config_json"):
+        raise HTTPException(404, f"ไม่พบ lab '{lab_name}' ที่สร้างจากหน้าเว็บ")
+    if row["status"] != "active":
+        raise HTTPException(409, f"lab '{lab_name}' สถานะ {row['status']} — ลบเครื่องได้เฉพาะ lab ที่ active")
+    stored = json.loads(row["config_json"])
+    users = list(stored.get("users", []))
+    if user not in users:
+        raise HTTPException(404, f"ไม่มีผู้เรียนชื่อ '{user}' ใน lab นี้")
+    if len(users) == 1:
+        raise HTTPException(400, "เป็นเครื่องสุดท้ายของ lab — ถ้าจะลบให้ใช้ Destroy ทั้ง lab")
+    user_os = {u: o for u, o in (stored.get("user_os") or {}).items() if u != user}
+    updated = {**stored, "users": [u for u in users if u != user]}
+    if user_os:
+        updated["user_os"] = user_os
+    else:
+        updated.pop("user_os", None)
+    try:
+        cfg = labctl.apply_product(labctl.validate_config(dict(updated)))
+        with aws.using_profile(stored.get("aws_profile")):
+            aws.resolve_verified()
+    except labctl.ConfigError as e:
+        raise HTTPException(400, str(e))
+    except aws.AwsError as e:
+        raise HTTPException(400, str(e))
+    # บันทึกก่อน apply เหมือน add_users — apply ล้มแล้วกดซ้ำจะได้ไม่สร้างเครื่องนี้กลับมา
+    db.update_lab_config(lab_name, updated)
+    job_id = jobs.enqueue("remove_user", {**cfg, "_remove_user": user})
+    return {"job_id": job_id, "lab_name": lab_name, "user": user}
 
 
 # ---------------------------------------------------------------------------
