@@ -280,6 +280,19 @@ def _run_job(job_id, kind, cfg):
                               f"— จะสร้าง handout ใหม่ให้เองเมื่อถอดได้ "
                               f"(เช็คทุก {PW_WATCH_INTERVAL} วิ นานสุด {PW_WATCH_MAX_MINUTES} นาที)\n")
                     start_password_watcher(cfg, pending)
+            elif kind == "reset":
+                # -replace ทำให้ terraform สร้าง instance ตัวนั้นใหม่ตัวเดียว
+                # เครื่องของผู้เรียนคนอื่นใน workspace เดียวกันไม่ถูกแตะ
+                target = cfg["_reset_user"]
+                _set_phase(job_id, "reset")
+                log.write(f"สร้างเครื่องของ {target} ใหม่ (เครื่องคนอื่นไม่ถูกแตะ)\n")
+                _tfrun(["apply", "-auto-approve", "-input=false",
+                        f"-replace=aws_instance.lab[\"{target}\"]",
+                        f"-var-file={varfile.name}"], lab=lab, log=log)
+                _set_phase(job_id, "export")
+                pending = _export_lab(cfg, lab, log)
+                if pending:
+                    start_password_watcher(cfg, pending)
             elif kind == "export":
                 # สร้าง handout ใหม่จาก state เดิม — ไม่เรียก apply/refresh จึงไม่
                 # แตะ resource บน AWS เลย ใช้ตอนเปลี่ยน lab guide หรือแก้ title
@@ -366,11 +379,42 @@ def start_scheduler():
     threading.Thread(target=_expiry_loop, daemon=True).start()
 
 
+# lab ที่เตือนไปแล้ว — เก็บคู่กับ expires_at เพื่อให้ต่อเวลาแล้วเตือนใหม่ได้
+_warned = {}
+_warn_lock = threading.Lock()
+
+
+def clear_expiry_warning(lab_name):
+    with _warn_lock:
+        _warned.pop(lab_name, None)
+
+
+def _warn_soon_to_expire(labs, now):
+    """เตือนก่อน lab ถูกลบอัตโนมัติ — ผู้เรียนกำลังทำ lab อยู่แล้วเครื่องหายพร้อมกัน
+    หมดคือเรื่องใหญ่ ผู้สอนต้องมีจังหวะกดต่อเวลาทัน"""
+    for lab in labs:
+        exp = lab.get("expires_at")
+        if lab.get("status") != "active" or not exp:
+            continue
+        mins = (exp - now) / 60
+        if not (0 < mins <= labctl.EXPIRY_WARN_MINUTES):
+            continue
+        name = lab["lab_name"]
+        with _warn_lock:
+            if _warned.get(name) == exp:
+                continue
+            _warned[name] = exp
+        labctl.notify(f"labctl: {name} จะถูกลบใน {mins:.0f} นาที",
+                      "กด 'ต่อเวลา' ในหน้า lab ถ้าคลาสยังไม่จบ")
+
+
 def _expiry_loop():
     while True:
         try:
             now = time.time()
-            for lab in labctl.due_labs(db.list_labs(), now):
+            all_labs = db.list_labs()
+            _warn_soon_to_expire(all_labs, now)
+            for lab in labctl.due_labs(all_labs, now):
                 last = db.latest_job_for_lab(lab["lab_name"])
                 if not labctl.should_attempt_destroy(last, now):
                     continue  # กำลังลบอยู่ หรือเพิ่งล้มไป — รอ cooldown ก่อน

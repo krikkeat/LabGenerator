@@ -20,7 +20,16 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) {
     let msg = `${res.status}`;
-    try { msg = (await res.json()).detail || msg; } catch (e) { /* noop */ }
+    try {
+      const d = (await res.json()).detail;
+      if (typeof d === 'string') msg = d;
+      // FastAPI ตอบ 422 เป็น list ของ object — แปลงเป็นข้อความที่อ่านรู้เรื่อง
+      // ไม่งั้นจะขึ้น "[object Object]" แล้วไม่มีใครรู้ว่าพังเพราะอะไร
+      else if (Array.isArray(d)) {
+        msg = `ข้อมูลที่ส่งไม่ถูกต้อง (${res.status}): ` + d.map(x =>
+          `${(x.loc || []).filter(k => k !== 'body').join('.') || 'request'} — ${x.msg}`).join(' · ');
+      } else if (d) msg = JSON.stringify(d);
+    } catch (e) { /* noop */ }
     throw new Error(msg);
   }
   return res.json();
@@ -353,11 +362,24 @@ function GuidePicker({ value, onChange, productGuide }) {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
     setFileErr(null);
-    if (f.size > 512 * 1024) { setFileErr('ไฟล์ใหญ่เกิน 512 KB'); return; }
+    const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+    const limit = isPdf ? 20 * 1024 * 1024 : 512 * 1024;
+    if (f.size > limit) {
+      setFileErr(`ไฟล์ใหญ่เกิน ${isPdf ? '20 MB' : '512 KB'}`);
+      return;
+    }
     const rd = new FileReader();
-    rd.onload = () => onChange({ ...value, markdown: String(rd.result), filename: f.name });
     rd.onerror = () => setFileErr('อ่านไฟล์ไม่สำเร็จ');
-    rd.readAsText(f);
+    if (isPdf) {
+      // PDF เป็นไบนารี — ส่งเป็น data URL แล้วให้ backend ถอด base64
+      rd.onload = () => onChange({ ...value, pdf: String(rd.result), markdown: '',
+                                   filename: f.name, size: f.size });
+      rd.readAsDataURL(f);
+    } else {
+      rd.onload = () => onChange({ ...value, markdown: String(rd.result), pdf: '',
+                                   filename: f.name, size: f.size });
+      rd.readAsText(f);
+    }
   }
 
   const selected = guides.find(g => g.path === value.path);
@@ -387,13 +409,15 @@ function GuidePicker({ value, onChange, productGuide }) {
       </div>
 
       ${value.mode === 'upload' && html`
-        <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain"
+        <input type="file" accept=".md,.markdown,.txt,.pdf,text/markdown,text/plain,application/pdf"
           onChange=${readFile} style="font:400 12.5px var(--sans); padding:7px" />
         ${value.filename && html`<div class="help">
-          แนบแล้ว: <b>${value.filename}</b> · ${(value.markdown || '').length.toLocaleString()} ตัวอักษร</div>`}
+          แนบแล้ว: <b>${value.filename}</b> · ${value.pdf
+            ? `PDF ${((value.size || 0) / 1024 / 1024).toFixed(1)} MB — จะแนบไปใน zip ของผู้เรียนทุกคน`
+            : `${(value.markdown || '').length.toLocaleString()} ตัวอักษร`}</div>`}
         ${fileErr && html`<div class="help bad">${fileErr}</div>`}
         ${!value.filename && !fileErr && html`<div class="help">
-          ไฟล์ Markdown (.md) — รองรับ # หัวข้อ, - รายการ, \`\`\` โค้ด, > quote</div>`}`}
+          Markdown (.md) ฝังเนื้อหาลงในหน้า handout · PDF (.pdf) แนบเป็นไฟล์ไปกับ zip</div>`}`}
 
       ${value.mode === 'pick' && html`
         <div style="display:flex; gap:8px; align-items:center">
@@ -435,7 +459,7 @@ function Wizard({ aws }) {
     custom_is_windows: pre?.custom_is_windows ?? true,
   });
   const [params, setParams] = useState(pre?.product_params || {});
-  const [guide, setGuide] = useState({ mode: 'upload', path: '', markdown: '', filename: '' });
+  const [guide, setGuide] = useState({ mode: 'upload', path: '', markdown: '', pdf: '', filename: '', size: 0 });
   useEffect(() => { PREFILL = null; }, []);
 
   useEffect(() => { api('/products').then(setCatalog).catch(e => setErr(e.message)); }, []);
@@ -484,7 +508,8 @@ function Wizard({ aws }) {
       body.product_params = Object.fromEntries(
         paramSpecs.map(([k]) => [k, (params[k] || '').trim()]).filter(([, v]) => v));
     }
-    if (guide.mode === 'upload' && guide.markdown.trim()) body.lab_guide_markdown = guide.markdown;
+    if (guide.mode === 'upload' && guide.pdf) body.lab_guide_pdf = guide.pdf;
+    else if (guide.mode === 'upload' && guide.markdown.trim()) body.lab_guide_markdown = guide.markdown;
     else if (guide.mode === 'pick' && guide.path) body.lab_guide = guide.path;
     if (form.instance_type) body.instance_type = form.instance_type;
     if (form.root_volume_gb) body.root_volume_gb = parseInt(form.root_volume_gb, 10);
@@ -611,7 +636,8 @@ function Wizard({ aws }) {
               <div class="review-row"><span class="k">Auto-expire</span>
                 <span class="v">${ttlNum > 0 ? `ลบอัตโนมัติหลัง ${form.ttl_hours} ชั่วโมง` : 'ปิด — ต้องกด Destroy เองตอนจบ'}</span></div>
               <div class="review-row"><span class="k">Lab guide</span>
-                <span class="v">${guide.mode === 'upload' && guide.filename ? `${guide.filename} (อัปโหลด)`
+                <span class="v">${guide.mode === 'upload' && guide.filename
+                  ? `${guide.filename} (อัปโหลด${guide.pdf ? ' PDF' : ''})`
                   : guide.mode === 'pick' && guide.path ? guide.path
                   : meta?.lab_guide ? `guide มาตรฐานของ ${meta.product_name}`
                   : 'ไม่ใส่ — handout จะมีเฉพาะวิธีเข้าเครื่อง'}</span></div>
@@ -698,6 +724,7 @@ const PHASES = {
     ['done', 'เสร็จสิ้น'],
   ],
   refresh: [['refresh', 'ดึงสถานะล่าสุดจาก AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
+  reset: [['reset', 'สร้างเครื่องของผู้เรียนใหม่'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   export: [['export', 'สร้าง handout + zip ใหม่'], ['done', 'เสร็จสิ้น']],
   destroy: [['destroy', 'ลบ resource ทั้งหมดบน AWS'], ['cleanup', 'ลบ key/handout ในเครื่อง'], ['done', 'เสร็จสิ้น']],
 };
@@ -801,6 +828,8 @@ function GuideCard({ labName, disabled, onDone }) {
   const [current, setCurrent] = useState(null);
   const [choice, setChoice] = useState('');
   const [markdown, setMarkdown] = useState('');
+  const [pdf, setPdf] = useState('');
+  const [pdfName, setPdfName] = useState('');
   const [mode, setMode] = useState('pick');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -821,7 +850,8 @@ function GuideCard({ labName, disabled, onDone }) {
   async function apply() {
     setBusy(true); setErr(null); setOkMsg(null);
     try {
-      const body = mode === 'write' ? { markdown } : { guide: choice };
+      const body = mode !== 'write' ? { guide: choice }
+        : (pdf ? { pdf } : { markdown });
       const r = await api(`/labs/${labName}/guide`, { method: 'PUT', body: JSON.stringify(body) });
       for (let i = 0; i < 90; i++) {
         await new Promise(res => setTimeout(res, 1000));
@@ -846,7 +876,8 @@ function GuideCard({ labName, disabled, onDone }) {
     setBusy(false);
   }
 
-  const canApply = !busy && !disabled && (mode === 'write' ? markdown.trim() : choice);
+  const canApply = !busy && !disabled
+    && (mode === 'write' ? (markdown.trim() || pdf) : choice);
 
   return html`
     <div class="card" style="margin-top:18px">
@@ -855,7 +886,8 @@ function GuideCard({ labName, disabled, onDone }) {
           <div style="font:700 14px var(--sans)">เปลี่ยน Hands-on Lab Guide</div>
           <div class="muted" style="font:400 12.5px var(--sans); margin-top:3px">
             ${current?.lab_guide
-              ? html`ใช้อยู่: <span class="mono">${current.lab_guide}</span>${current.exists ? '' : ' (ไม่พบไฟล์)'}`
+              ? html`ใช้อยู่: <span class="mono">${current.lab_guide}</span>${
+                  current.kind === 'pdf' ? ' · PDF' : ''}${current.exists ? '' : ' (ไม่พบไฟล์)'}`
               : 'lab นี้ยังไม่มี guide — แนบตอนนี้แล้วสร้าง handout ใหม่ได้'}
           </div>
         </div>
@@ -889,16 +921,27 @@ function GuideCard({ labName, disabled, onDone }) {
       : html`
         <div class="field" style="margin-top:12px">
           <label>Markdown <span class="opt">อัปโหลดไฟล์มาแก้ต่อ หรือพิมพ์เองก็ได้</span></label>
-          <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain"
+          <input type="file" accept=".md,.markdown,.txt,.pdf,text/markdown,text/plain,application/pdf"
             style="font:400 12.5px var(--sans); padding:7px; margin-bottom:8px"
             onChange=${(e) => {
               const f = e.target.files && e.target.files[0];
               if (!f) return;
-              if (f.size > 512 * 1024) { setErr('ไฟล์ใหญ่เกิน 512 KB'); return; }
+              const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+              if (f.size > (isPdf ? 20 * 1024 * 1024 : 512 * 1024)) {
+                setErr(`ไฟล์ใหญ่เกิน ${isPdf ? '20 MB' : '512 KB'}`); return;
+              }
               const rd = new FileReader();
-              rd.onload = () => { setErr(null); setMarkdown(String(rd.result)); };
-              rd.readAsText(f);
+              rd.onerror = () => setErr('อ่านไฟล์ไม่สำเร็จ');
+              if (isPdf) {
+                rd.onload = () => { setErr(null); setPdf(String(rd.result)); setPdfName(f.name); };
+                rd.readAsDataURL(f);
+              } else {
+                rd.onload = () => { setErr(null); setPdf(''); setPdfName(''); setMarkdown(String(rd.result)); };
+                rd.readAsText(f);
+              }
             }} />
+          ${pdfName && html`<div class="help">แนบ PDF: <b>${pdfName}</b> —
+            จะถูกแนบไปในโฟลเดอร์ของผู้เรียนทุกคน (เนื้อหาด้านล่างจะไม่ถูกใช้)</div>`}
           <textarea rows="12" value=${markdown} placeholder="# ขั้นตอนที่ 1\n..."
             style="font:400 12.5px var(--mono); resize:vertical"
             onInput=${(e) => setMarkdown(e.target.value)}></textarea>
@@ -925,6 +968,7 @@ function Dashboard({ labName }) {
   const [destroyOpen, setDestroyOpen] = useState(false);
   const [confirmText, setConfirmText] = useState('');
   const [delGuide, setDelGuide] = useState(false);
+  const [notice, setNotice] = useState(null);
   const [guidePath, setGuidePath] = useState(null);
   const [reach, setReach] = useState({});
   const [reachBusy, setReachBusy] = useState(false);
@@ -936,7 +980,10 @@ function Dashboard({ labName }) {
   useEffect(load, [load]);
 
   // guide ที่อัปโหลดให้ lab นี้โดยเฉพาะ — ตัวเดียวที่เสนอให้ลบพร้อม lab ได้
-  const ownGuide = guidePath && guidePath === `lab-guides/${labName}-custom.md`;
+  // guide ที่อัปโหลดให้ lab นี้โดยเฉพาะ (md หรือ pdf) — ต้องเป็น boolean เสมอ
+  // เพราะค่านี้ถูกส่งไป backend ตรง ๆ: null && x ได้ null แล้ว backend ตอบ 422
+  const ownGuide = !!guidePath && [`lab-guides/${labName}-custom.md`,
+    `lab-guides/${labName}-custom.pdf`].includes(guidePath);
 
   function copyIp(m) {
     try { navigator.clipboard.writeText(m.public_ip); } catch (e) { /* noop */ }
@@ -961,6 +1008,26 @@ function Dashboard({ labName }) {
     nav('/new');
   }
 
+  async function doExtend(hours) {
+    try {
+      const r = await api(`/labs/${labName}/extend`, {
+        method: 'POST', body: JSON.stringify({ hours }),
+      });
+      setErr(null);
+      setNotice(`ต่อเวลาอีก ${hours} ชม. — ลบอัตโนมัติ ${new Date(r.expires_at * 1000)
+        .toLocaleString('th-TH', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}`);
+      load();
+    } catch (e) { setErr(e.message); }
+  }
+
+  async function doReset(user) {
+    if (!confirm(`สร้างเครื่องของ ${user} ใหม่? ข้อมูลในเครื่องเดิมจะหายทั้งหมด (เครื่องคนอื่นไม่กระทบ)`)) return;
+    try {
+      const r = await api(`/labs/${labName}/users/${user}/reset`, { method: 'POST' });
+      nav(`/job/${r.job_id}?lab=${labName}`);
+    } catch (e) { setErr(e.message); }
+  }
+
   async function doRefresh() {
     try {
       const r = await api(`/labs/${labName}/refresh`, { method: 'POST' });
@@ -972,7 +1039,7 @@ function Dashboard({ labName }) {
     try {
       const r = await api(`/labs/${labName}`, {
         method: 'DELETE',
-        body: JSON.stringify({ confirm: confirmText, delete_guide: ownGuide && delGuide }),
+        body: JSON.stringify({ confirm: confirmText, delete_guide: Boolean(ownGuide && delGuide) }),
       });
       setDestroyOpen(false);
       nav(`/job/${r.job_id}?lab=${labName}`);
@@ -1005,6 +1072,8 @@ function Dashboard({ labName }) {
           <button class="btn ghost small" onClick=${checkReach} disabled=${reachBusy || busyJob}>
             ${reachBusy ? 'กำลังตรวจ…' : '⇄ ตรวจการเชื่อมต่อ'}</button>
           <button class="btn ghost small" onClick=${cloneLab}>⧉ สร้างซ้ำ</button>
+          ${lab.status === 'active' && html`<button class="btn ghost small" disabled=${busyJob}
+            onClick=${() => doExtend(1)}>+1 ชม.</button>`}
           <button class="btn ghost small" onClick=${doRefresh} disabled=${busyJob}>↻ Refresh</button>
           <a class="btn ghost small" href="/api/labs/${labName}/handouts/export" download>⤓ Export ทั้งหมด</a>
           <button class="btn danger small" disabled=${busyJob}
@@ -1012,6 +1081,18 @@ function Dashboard({ labName }) {
         </div>
       </div>
       <${ErrBox} err=${err} />
+      ${notice && html`<div class="ok-box" style="margin-bottom:14px">✔ ${notice}</div>`}
+      ${lab.status === 'active' && lab.expires_at
+        && (lab.expires_at * 1000 - Date.now()) < 30 * 60000
+        && (lab.expires_at * 1000 - Date.now()) > 0 && html`
+        <div class="warn-box" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
+          <span>lab นี้จะถูกลบอัตโนมัติใน ${Math.max(0, Math.round((lab.expires_at * 1000 - Date.now()) / 60000))} นาที
+            — ถ้าคลาสยังไม่จบให้ต่อเวลาก่อน</span>
+          <span style="display:flex; gap:6px">
+            <button class="btn ghost small" onClick=${() => doExtend(1)}>+1 ชม.</button>
+            <button class="btn ghost small" onClick=${() => doExtend(2)}>+2 ชม.</button>
+          </span>
+        </div>`}
 
       ${lab.status === 'active' && lab.machines.length > 0
         && html`<${GuideCard} labName=${labName} disabled=${busyJob} onDone=${load} />`}
@@ -1055,6 +1136,9 @@ function Dashboard({ labName }) {
                 ${m.handout_ready
                   ? html`<a href="/api/labs/${labName}/handouts/${m.user}.zip" download>⤓ handout .zip</a>`
                   : html`<span class="muted" style="font:600 11px var(--mono)">handout ยังไม่พร้อม</span>`}
+                ${lab.status === 'active' && html`<button class="btn tiny" disabled=${busyJob}
+                  title="สร้างเครื่องของคนนี้ใหม่ เครื่องคนอื่นไม่กระทบ"
+                  onClick=${() => doReset(m.user)}>↺ reset</button>`}
               </div>
             </div>`)}
         </div>`}

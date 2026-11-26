@@ -78,6 +78,13 @@ def update_lab_config(lab_name, config):
                      (json.dumps(config, ensure_ascii=False), lab_name))
 
 
+def update_lab_expiry(lab_name, expires_at, ttl_hours=None, expire_date=None):
+    """เลื่อนเวลาหมดอายุ — ใช้ตอนคลาสยืดเวลาแล้วต้องต่ออายุ lab"""
+    with get_conn() as conn:
+        conn.execute("UPDATE labs SET expires_at=?, ttl_hours=?, expire_date=COALESCE(?, expire_date) "
+                     "WHERE lab_name=?", (expires_at, ttl_hours, expire_date, lab_name))
+
+
 def set_lab_status(lab_name, status):
     with get_conn() as conn:
         conn.execute("UPDATE labs SET status=? WHERE lab_name=?", (status, lab_name))

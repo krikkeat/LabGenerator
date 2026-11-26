@@ -20,3 +20,4 @@ bin/
 # ขยะของ macOS / ร่องรอยการย้ายโปรเจกต์
 .DS_Store
 *.moved-to-home
+.venv/

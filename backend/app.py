@@ -45,6 +45,20 @@ SESSION_COOKIE = "labctl_session"
 
 
 @app.middleware("http")
+async def _no_stale_frontend(request: Request, call_next):
+    """บังคับให้ browser ถามเซิร์ฟเวอร์ก่อนใช้ไฟล์หน้าเว็บที่แคชไว้
+
+    ES module ถูกแคชแรงเป็นพิเศษ — แก้ app.js แล้วผู้ใช้ยังเห็นของเก่าจนกว่าจะ
+    hard reload ซึ่งไม่มีใครเดาถูก (เสียเวลาไล่บั๊กที่แก้ไปแล้ว)
+    ETag ยังทำงานปกติ การ revalidate จึงตอบ 304 ไม่ได้โหลดใหม่ทั้งไฟล์
+    """
+    resp = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
+@app.middleware("http")
 async def _require_login(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/") and not path.startswith("/api/auth/"):
@@ -251,13 +265,41 @@ def api_labs():
 
 
 GUIDE_MAX_BYTES = 512 * 1024
+# PDF ใหญ่กว่า markdown มาก และถูกคัดลอกเข้า zip ของผู้เรียน "ทุกคน" —
+# 20 MB × 20 คน = 400 MB บนดิสก์ จึงต้องมีเพดานที่สมเหตุสมผล
+GUIDE_PDF_MAX_BYTES = 20 * 1024 * 1024
 
 
-def _resolve_guide(lab_name, guide, markdown):
+def _decode_pdf(b64):
+    """แปลง base64 ที่หน้าเว็บส่งมาเป็นไบต์ + กันไฟล์ใหญ่เกิน
+
+    รับ data URL ด้วย (FileReader.readAsDataURL คืนรูปแบบนั้น) จะได้ไม่ต้องให้
+    ฝั่งหน้าเว็บมาตัด prefix เอง
+    """
+    import base64
+    if "," in b64[:100] and b64.lstrip().startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    try:
+        data = base64.b64decode(b64, validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "ไฟล์ PDF ที่ส่งมาถอดรหัสไม่ได้")
+    if len(data) > GUIDE_PDF_MAX_BYTES:
+        raise HTTPException(400, f"ไฟล์ PDF ใหญ่เกิน {GUIDE_PDF_MAX_BYTES // (1024*1024)} MB")
+    if not data:
+        raise HTTPException(400, "ไฟล์ PDF ว่างเปล่า")
+    return data
+
+
+def _resolve_guide(lab_name, guide, markdown, pdf_base64=None):
     """คืน path ของ lab guide ที่จะใช้ — จากไฟล์ที่อัปโหลดมา หรือไฟล์ที่มีอยู่แล้ว
 
     ใช้ร่วมกันระหว่างตอนสร้าง lab กับตอนเปลี่ยน guide ทีหลัง กติกาจะได้ไม่หลุดกัน
     """
+    if pdf_base64:
+        try:
+            return labctl.save_custom_guide_pdf(lab_name, _decode_pdf(pdf_base64))
+        except labctl.ConfigError as e:
+            raise HTTPException(400, str(e))
     if markdown is not None and markdown.strip():
         if len(markdown.encode("utf-8")) > GUIDE_MAX_BYTES:
             raise HTTPException(400, f"ไฟล์ lab guide ใหญ่เกิน {GUIDE_MAX_BYTES // 1024} KB")
@@ -295,6 +337,10 @@ class CreateLabBody(BaseModel):
     # หรือส่งเนื้อไฟล์ที่ผู้สอนอัปโหลดมา (lab_guide_markdown)
     lab_guide: Optional[str] = None
     lab_guide_markdown: Optional[str] = None
+    # lab guide ที่อัปโหลดมาเป็น PDF (base64 หรือ data URL จาก FileReader)
+    lab_guide_pdf: Optional[str] = None
+    # spot instance — ถูกกว่ามากแต่ถูกยึดคืนได้ เหมาะกับ lab สั้น ๆ ที่สร้างใหม่เร็ว
+    use_spot: Optional[bool] = None
 
 
 @app.post("/api/labs", status_code=202)
@@ -308,6 +354,7 @@ def api_create_lab(body: CreateLabBody):
         raise HTTPException(400, "ttl_hours ต้องอยู่ระหว่าง 0 (ปิด) ถึง 336 (14 วัน)")
     guide_sel = cfg.pop("lab_guide", None)
     guide_md = cfg.pop("lab_guide_markdown", None)
+    guide_pdf = cfg.pop("lab_guide_pdf", None)
     if "users" not in cfg:
         cfg["users"] = []
     try:
@@ -315,7 +362,7 @@ def api_create_lab(body: CreateLabBody):
     except labctl.ConfigError as e:
         raise HTTPException(400, str(e))
     # แนบหลัง apply_product เพื่อให้ guide ที่ผู้สอนเลือกเองชนะ guide ประจำ product
-    guide_path = _resolve_guide(cfg["lab_name"], guide_sel, guide_md)
+    guide_path = _resolve_guide(cfg["lab_name"], guide_sel, guide_md, guide_pdf)
     if guide_path:
         cfg["lab_guide"] = guide_path
     # tag Expire บน resource ต้องตรงกับเวลาที่ lab จะถูกลบจริง ไม่ใช่ค่าที่พิมพ์มาเอง
@@ -485,6 +532,8 @@ class GuideBody(BaseModel):
     guide: Optional[str] = None
     # …หรือวาง markdown เข้ามาตรง ๆ (จะถูกเก็บเป็น lab-guides/<lab>-custom.md)
     markdown: Optional[str] = None
+    # …หรืออัปโหลดเป็น PDF (เก็บเป็น lab-guides/<lab>-custom.pdf)
+    pdf: Optional[str] = None
 
 
 @app.get("/api/labs/{lab_name}/guide")
@@ -494,11 +543,16 @@ def api_get_guide(lab_name: str):
     if cfg is None:
         raise HTTPException(404, f"ไม่พบ config ของ lab '{lab_name}'")
     path = cfg.get("lab_guide") or None
-    content = None
+    content, exists, kind = None, False, None
     if path:
         p = labctl.BASE_DIR / path
-        content = p.read_text(encoding="utf-8") if p.exists() else None
-    return {"lab_guide": path, "exists": content is not None, "content": content}
+        exists = p.exists()
+        kind = "pdf" if path.lower().endswith(".pdf") else "markdown"
+        # PDF ไม่ส่งเนื้อไฟล์กลับ — หน้าเว็บเอาไปแก้ต่อไม่ได้อยู่แล้ว และไฟล์ใหญ่
+        if exists and kind == "markdown":
+            content = p.read_text(encoding="utf-8")
+    return {"lab_guide": path, "exists": exists, "kind": kind, "content": content,
+            "size": (labctl.BASE_DIR / path).stat().st_size if path and exists else None}
 
 
 @app.put("/api/labs/{lab_name}/guide", status_code=202)
@@ -514,9 +568,9 @@ def api_set_guide(lab_name: str, body: GuideBody):
         raise HTTPException(409, f"lab '{lab_name}' สถานะ {status} — "
                                  "สร้าง handout ใหม่ได้เฉพาะ lab ที่ active")
 
-    guide_path = _resolve_guide(lab_name, body.guide, body.markdown)
+    guide_path = _resolve_guide(lab_name, body.guide, body.markdown, body.pdf)
     if not guide_path:
-        raise HTTPException(400, "ต้องระบุ guide (ไฟล์ที่มีอยู่) หรือ markdown อย่างใดอย่างหนึ่ง")
+        raise HTTPException(400, "ต้องระบุ guide: เลือกไฟล์ที่มีอยู่ วาง markdown หรืออัปโหลด PDF")
 
     if row and row.get("config_json"):
         stored = json.loads(row["config_json"])
@@ -538,6 +592,96 @@ def api_set_guide(lab_name: str, body: GuideBody):
 
 
 # ---------------------------------------------------------------------------
+# ต่อเวลา / reset เครื่องรายคน
+# ---------------------------------------------------------------------------
+
+class ExtendBody(BaseModel):
+    hours: float = 1.0
+
+
+@app.post("/api/labs/{lab_name}/extend")
+def api_extend(lab_name: str, body: ExtendBody):
+    """เลื่อนเวลาลบอัตโนมัติออกไป — ใช้ตอนคลาสยืดเวลา จะได้ไม่ต้องสร้าง lab ใหม่"""
+    row = db.get_lab(lab_name)
+    if not row:
+        raise HTTPException(404, f"ไม่พบ lab '{lab_name}'")
+    if row["status"] != "active":
+        raise HTTPException(409, f"lab '{lab_name}' สถานะ {row['status']} — ต่อเวลาได้เฉพาะ lab ที่ active")
+    if body.hours <= 0 or body.hours > labctl.TTL_MAX_HOURS:
+        raise HTTPException(400, f"ต่อเวลาได้ครั้งละ 0–{labctl.TTL_MAX_HOURS} ชั่วโมง")
+    import time as _t
+    now = _t.time()
+    # ต่อจากเวลาเดิมถ้ายังไม่หมด · ต่อจากตอนนี้ถ้าเลยกำหนดไปแล้ว
+    base = max(row["expires_at"] or now, now)
+    new_exp = base + body.hours * 3600
+    total_ttl = (new_exp - now) / 3600
+    new_date = labctl.expire_date_from_ttl(total_ttl)
+    db.update_lab_expiry(lab_name, new_exp, ttl_hours=total_ttl, expire_date=new_date)
+    if row.get("config_json"):
+        stored = json.loads(row["config_json"])
+        stored["expire_date"] = new_date
+        db.update_lab_config(lab_name, stored)
+    jobs.clear_expiry_warning(lab_name)
+    return {"lab_name": lab_name, "expires_at": new_exp, "expire_date": new_date,
+            "added_hours": body.hours,
+            # tag Expire บน AWS ยังเป็นค่าเดิมจนกว่าจะ apply รอบถัดไป — บอกให้ชัด
+            "note": "tag Expire บน resource จะอัปเดตเมื่อ apply ครั้งถัดไป"}
+
+
+class PowerBody(BaseModel):
+    action: str          # stop | start
+
+
+@app.post("/api/labs/{lab_name}/power")
+def api_power(lab_name: str, body: PowerBody):
+    """หยุด/เปิดเครื่องทั้ง lab — ประหยัดค่า compute ตอนคลาสข้ามคืน
+
+    ไม่ลบอะไร: EBS ยังอยู่ ข้อมูลในเครื่องยังอยู่ · public IP จะเปลี่ยนหลัง start
+    จึงต้องสร้าง handout ใหม่ตามด้วย
+    """
+    if body.action not in ("stop", "start"):
+        raise HTTPException(400, "action ต้องเป็น stop หรือ start")
+    row = db.get_lab(lab_name)
+    if row and row["status"] not in ("active",):
+        raise HTTPException(409, f"lab '{lab_name}' สถานะ {row['status']}")
+    try:
+        outputs = jobs.tf_outputs_for(lab_name)
+    except (jobs.JobFailure, ValueError, OSError) as e:
+        raise HTTPException(400, f"อ่านข้อมูลเครื่องไม่ได้: {e}")
+    if not outputs:
+        raise HTTPException(404, f"ไม่พบเครื่องของ lab '{lab_name}'")
+    ids = [vm["instance_id"] for vm in outputs["lab_info"].values()]
+    cfg = _find_config_for(lab_name) or {}
+    try:
+        res = aws.power_instances(ids, body.action, region=cfg.get("region"))
+    except aws.AwsError as e:
+        # spot แบบ one-time หยุดไม่ได้ตามข้อกำหนดของ AWS — เป็นคู่ที่คนเลือกผิดบ่อย
+        # (เลือก spot เพื่อประหยัด แล้วอยากหยุดเครื่องข้ามคืนเพื่อประหยัดอีก)
+        if e.code == "UnsupportedOperation" and cfg.get("use_spot"):
+            raise HTTPException(400,
+                "lab นี้ใช้ spot instance ซึ่ง AWS ไม่ให้หยุดชั่วคราว — "
+                "ถ้าต้องการ stop/start ข้ามคืน ให้สร้าง lab แบบปกติ (ไม่ใส่ spot) "
+                "หรือถ้าจบคลาสแล้วก็ destroy ทิ้งได้เลย")
+        raise HTTPException(400, str(e))
+    if body.action == "start":
+        # IP ใหม่หลังเปิดเครื่อง — handout เดิมจะพาผู้เรียนไปผิดที่
+        res["note"] = "IP จะเปลี่ยนหลังเครื่องบูตเสร็จ — กด Refresh เพื่อสร้าง handout ใหม่"
+    return res
+
+
+@app.post("/api/labs/{lab_name}/users/{user}/reset", status_code=202)
+def api_reset_user(lab_name: str, user: str):
+    """สร้างเครื่องของผู้เรียนคนเดียวใหม่ — เครื่องคนอื่นในคลาสไม่ถูกแตะ"""
+    cfg = _prepared_cfg(lab_name)
+    if user not in cfg.get("users", []):
+        raise HTTPException(404, f"ไม่มีผู้เรียนชื่อ '{user}' ใน lab นี้")
+    cfg = dict(cfg)
+    cfg["_reset_user"] = user
+    job_id = jobs.enqueue("reset", cfg)
+    return {"job_id": job_id, "lab_name": lab_name, "user": user}
+
+
+# ---------------------------------------------------------------------------
 # refresh / destroy
 # ---------------------------------------------------------------------------
 
@@ -551,7 +695,7 @@ def api_refresh(lab_name: str):
 class DestroyBody(BaseModel):
     confirm: str
     # ลบไฟล์ guide ที่อัปโหลดไว้ให้ lab นี้ด้วยไหม (เฉพาะ *-custom.md ของ lab นี้)
-    delete_guide: bool = False
+    delete_guide: Optional[bool] = False   # null = ไม่ลบ (หน้าเว็บเวอร์ชันเก่าส่ง null มา)
 
 
 @app.delete("/api/labs/{lab_name}", status_code=202)

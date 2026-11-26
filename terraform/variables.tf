@@ -83,3 +83,9 @@ variable "expire_date" {
   type        = string
   default     = ""
 }
+
+variable "use_spot" {
+  description = "ใช้ spot instance (ถูกกว่า 60-70% แต่ AWS ยึดคืนได้ — เหมาะกับ lab ที่สร้างใหม่ได้เร็ว)"
+  type        = bool
+  default     = false
+}

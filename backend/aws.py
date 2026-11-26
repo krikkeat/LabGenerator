@@ -462,6 +462,101 @@ _EC2_SCANS = [
 ]
 
 
+def create_image(instance_id, name, description="", region=None, timeout=30):
+    """สั่งอบ AMI จาก instance ที่รันอยู่ — คืน ami-id ทันที (ยังไม่พร้อมใช้)"""
+    creds = resolve_verified(timeout=timeout)
+    region = region or creds["region"]
+    params = {"Action": "CreateImage", "Version": EC2_API_VERSION,
+              "InstanceId": instance_id, "Name": name, "Description": description,
+              # ไม่ปิดเครื่องก่อน = ภาพอาจไม่ consistent · ยอมให้ reboot ดีกว่าได้ภาพเสีย
+              "NoReboot": "false"}
+    root = _signed_post("ec2", region, f"ec2.{region}.amazonaws.com", params,
+                        creds["access_key"], creds["secret_key"],
+                        creds["session_token"], timeout)
+    ami = root.findtext(".//{*}imageId")
+    if not ami:
+        raise AwsError("AWS ไม่ได้คืน imageId กลับมา")
+    return ami
+
+
+def image_state(ami_id, region=None, timeout=20):
+    creds = resolve_verified(timeout=timeout)
+    region = region or creds["region"]
+    root = _signed_post("ec2", region, f"ec2.{region}.amazonaws.com",
+                        {"Action": "DescribeImages", "Version": EC2_API_VERSION,
+                         "ImageId.1": ami_id},
+                        creds["access_key"], creds["secret_key"],
+                        creds["session_token"], timeout)
+    return root.findtext(".//{*}imagesSet/{*}item/{*}imageState") or "unknown"
+
+
+def wait_image_available(ami_id, region=None, timeout_minutes=20, interval=20):
+    deadline = time.time() + timeout_minutes * 60
+    while time.time() < deadline:
+        state = image_state(ami_id, region=region)
+        if state in ("available", "failed", "error", "invalid"):
+            return state
+        time.sleep(interval)
+    return "pending"
+
+
+def delete_image(ami_id, region=None, timeout=30):
+    """ลบ AMI พร้อม snapshot ที่ผูกอยู่ — ไม่ลบ snapshot ด้วยจะเสียค่าเก็บไปเรื่อย ๆ"""
+    creds = resolve_verified(timeout=timeout)
+    region = region or creds["region"]
+    host = f"ec2.{region}.amazonaws.com"
+
+    root = _signed_post("ec2", region, host,
+                        {"Action": "DescribeImages", "Version": EC2_API_VERSION,
+                         "ImageId.1": ami_id},
+                        creds["access_key"], creds["secret_key"],
+                        creds["session_token"], timeout)
+    snaps = [e.text for e in root.findall(".//{*}ebs/{*}snapshotId") if e.text]
+
+    _signed_post("ec2", region, host,
+                 {"Action": "DeregisterImage", "Version": EC2_API_VERSION, "ImageId": ami_id},
+                 creds["access_key"], creds["secret_key"], creds["session_token"], timeout)
+    deleted = []
+    for snap in snaps:
+        try:
+            _signed_post("ec2", region, host,
+                         {"Action": "DeleteSnapshot", "Version": EC2_API_VERSION,
+                          "SnapshotId": snap},
+                         creds["access_key"], creds["secret_key"],
+                         creds["session_token"], timeout)
+            deleted.append(snap)
+        except AwsError:
+            pass          # snapshot อาจถูกใช้โดย AMI อื่น — ปล่อยไว้ดีกว่าพัง
+    return {"ami": ami_id, "snapshots_deleted": deleted}
+
+
+def power_instances(instance_ids, action, region=None, timeout=30):
+    """สั่ง stop/start instance ตรงผ่าน EC2 API — ไม่ผ่าน terraform
+
+    ทำไมไม่ใช้ terraform: การ stop ไม่ได้เปลี่ยนรูปทรงของ infrastructure จึงไม่ควร
+    ไปแตะ state · แถม terraform ไม่มี resource สำหรับ "หยุดเครื่องชั่วคราว" อยู่แล้ว
+    """
+    if action not in ("stop", "start"):
+        raise AwsError(f"ไม่รู้จักคำสั่ง '{action}'")
+    if not instance_ids:
+        return {"action": action, "instances": []}
+    creds = resolve_verified(timeout=timeout)
+    region = region or creds["region"]
+    params = {"Action": "StopInstances" if action == "stop" else "StartInstances",
+              "Version": EC2_API_VERSION}
+    for i, iid in enumerate(instance_ids, 1):
+        params[f"InstanceId.{i}"] = iid
+    root = _signed_post("ec2", region, f"ec2.{region}.amazonaws.com", params,
+                        creds["access_key"], creds["secret_key"],
+                        creds["session_token"], timeout)
+    out = []
+    for item in root.findall(".//{*}instancesSet/{*}item"):
+        out.append({"instance_id": item.findtext("{*}instanceId"),
+                    "previous": item.findtext("{*}previousState/{*}name"),
+                    "current": item.findtext("{*}currentState/{*}name")})
+    return {"action": action, "region": region, "instances": out}
+
+
 _regions_cache = {"t": 0.0, "list": None}
 
 

@@ -14,11 +14,13 @@ if curl -s -o /dev/null --max-time 2 "$URL/api/auth/status" 2>/dev/null; then
   exit 0
 fi
 
-# ครั้งแรก: ติดตั้ง dependencies ของ web UI ให้อัตโนมัติ
-if ! python3 -c "import fastapi, uvicorn" 2>/dev/null; then
-  echo "ติดตั้ง dependencies ครั้งแรก (fastapi + uvicorn)…"
-  pip3 install --quiet --user fastapi 'uvicorn[standard]' || {
-    echo "ติดตั้งไม่สำเร็จ — ลองรันเอง: pip3 install --user fastapi 'uvicorn[standard]'"
+# ใช้ venv ของโปรเจกต์ (.venv) — Homebrew Python บล็อก pip install --user (PEP 668)
+PY=".venv/bin/python"
+if ! "$PY" -c "import fastapi, uvicorn" 2>/dev/null; then
+  echo "ติดตั้ง dependencies ครั้งแรก (fastapi + uvicorn) ลง .venv…"
+  { [ -x "$PY" ] || python3 -m venv .venv; } && \
+  "$PY" -m pip install --quiet fastapi 'uvicorn[standard]' || {
+    echo "ติดตั้งไม่สำเร็จ — ลองรันเอง: python3 -m venv .venv && .venv/bin/pip install fastapi 'uvicorn[standard]'"
     read -r -p "กด Enter เพื่อปิด…"
     exit 1
   }
@@ -30,4 +32,4 @@ if ! command -v terraform >/dev/null; then
 fi
 
 echo "เปิด labctl ที่ $URL  (หยุดด้วย Ctrl+C หรือปิดหน้าต่างนี้)"
-exec python3 labctl.py serve
+exec "$PY" labctl.py serve

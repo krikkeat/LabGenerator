@@ -31,6 +31,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -280,6 +281,7 @@ def build_tfvars(cfg):
         "custom_ami": cfg.get("custom_ami", ""),
         "custom_username": cfg.get("custom_username", ""),
         "custom_is_windows": bool(cfg.get("custom_is_windows", False)),
+        "use_spot": bool(cfg.get("use_spot", False)),
     }
     bootstrap = cfg.get("bootstrap_script", "")
     if bootstrap:
@@ -554,6 +556,27 @@ Desktop) → กด <strong>+</strong> → Add PC → ช่อง PC name ใ�
 </div>"""
 
 
+GUIDE_PDF_NAME = "lab-guide.pdf"
+
+
+def render_pdf_guide_section(filename, size_bytes):
+    """ส่วน lab guide เมื่อผู้สอนแนบมาเป็น PDF
+
+    ใช้ <object> เพราะ browser ส่วนใหญ่แสดง PDF ในหน้าได้เลย และมีลิงก์สำรอง
+    ข้างในเผื่อ browser ที่แสดงไม่ได้ (หรือเปิดไฟล์จากดิสก์แล้วโดนบล็อก)
+    """
+    mb = size_bytes / (1024 * 1024)
+    return f"""
+<h1>Lab Guide</h1>
+<p>คู่มือของ lab นี้เป็นไฟล์ PDF แนบมาในโฟลเดอร์เดียวกับเอกสารนี้
+(<code>{html.escape(filename)}</code> · {mb:.1f} MB)</p>
+<p><a href="{html.escape(filename)}" target="_blank"><strong>เปิด lab guide (PDF) →</strong></a></p>
+<object data="{html.escape(filename)}" type="application/pdf" width="100%" height="800">
+  <div class="warn">เบราว์เซอร์นี้แสดง PDF ในหน้าไม่ได้ —
+    กดลิงก์ด้านบนเพื่อเปิดด้วยโปรแกรมอ่าน PDF แทน</div>
+</object>"""
+
+
 def render_user_handout(cfg, user, vm, guide_html, win_password):
     lab = cfg["lab_name"]
     key_file = f"{user}.pem"
@@ -619,9 +642,10 @@ def list_lab_guides():
     """
     out = []
     if GUIDES_DIR.exists():
-        for p in sorted(GUIDES_DIR.glob("*.md")):
+        for p in sorted(list(GUIDES_DIR.glob("*.md")) + list(GUIDES_DIR.glob("*.pdf"))):
             rel = f"lab-guides/{p.name}"
             out.append({"path": rel, "name": p.stem, "source": "lab-guides",
+                        "kind": "pdf" if p.suffix == ".pdf" else "markdown",
                         "size": p.stat().st_size, "deletable": is_custom_guide(rel)})
     for meta_path in sorted(PRODUCTS_DIR.glob("*/product.json")):
         pdir = meta_path.parent
@@ -631,7 +655,8 @@ def list_lab_guides():
             continue
         gname = meta.get("lab_guide")
         if gname and (pdir / gname).exists():
-            out.append({"path": f"products/{pdir.name}/{gname}",
+            out.append({"kind": "pdf" if gname.endswith(".pdf") else "markdown",
+                        "path": f"products/{pdir.name}/{gname}",
                         "name": meta.get("product_name") or pdir.name,
                         "source": f"product:{pdir.name}",
                         "size": (pdir / gname).stat().st_size,
@@ -642,7 +667,8 @@ def list_lab_guides():
 def is_custom_guide(path):
     """guide ที่ผู้สอนอัปโหลด/พิมพ์เอง — ลบได้ ต่างจาก guide ที่มากับโปรเจกต์
     หรือของ product ซึ่งเป็นเนื้อหาที่ใช้ร่วมกันทุก lab"""
-    return path.startswith("lab-guides/") and path.endswith("-custom.md")
+    return path.startswith("lab-guides/") and (
+        path.endswith("-custom.md") or path.endswith("-custom.pdf"))
 
 
 def delete_custom_guide(path):
@@ -652,6 +678,25 @@ def delete_custom_guide(path):
     if p.resolve().parent != GUIDES_DIR.resolve():
         raise ConfigError("path ไม่ถูกต้อง")
     p.unlink(missing_ok=True)
+
+
+PDF_MAGIC = b"%PDF-"
+
+
+def save_custom_guide_pdf(lab_name, data):
+    """เก็บ lab guide ที่อัปโหลดมาเป็น PDF
+
+    ตรวจ magic bytes ก่อน: ไฟล์นี้จะถูกแจกต่อให้ผู้เรียนทุกคน ถ้าปล่อยให้อัปโหลด
+    อะไรก็ได้แล้วตั้งนามสกุล .pdf ก็เท่ากับใช้ระบบเป็นช่องทางส่งไฟล์อะไรก็ได้
+    """
+    if not re.fullmatch(r"[a-z0-9-]{1,32}", lab_name):
+        raise ConfigError("ชื่อ lab ไม่ถูกต้อง")
+    if not data[:5] == PDF_MAGIC:
+        raise ConfigError("ไฟล์นี้ไม่ใช่ PDF (ตรวจจากหัวไฟล์)")
+    GUIDES_DIR.mkdir(parents=True, exist_ok=True)
+    p = GUIDES_DIR / f"{lab_name}-custom.pdf"
+    p.write_bytes(data)
+    return f"lab-guides/{p.name}"
 
 
 def save_custom_guide(lab_name, markdown):
@@ -740,15 +785,21 @@ def export_lab(cfg):
     guide_html = ("<p><em>ผู้สอนยังไม่ได้แนบ lab guide สำหรับ lab นี้ — "
                   "แนบภายหลังแล้วสร้าง handout ใหม่ได้จากหน้า lab</em></p>")
     guide_path = cfg.get("lab_guide", "")
+    guide_pdf = None          # ไฟล์ PDF ที่ต้องคัดลอกเข้าโฟลเดอร์ของผู้เรียนทุกคน
     if guide_path:
         gp = BASE_DIR / guide_path
-        if gp.exists():
+        if not gp.exists():
+            info(f"คำเตือน: ไม่พบ lab guide {gp} — handout จะไม่มีเนื้อหา guide")
+        elif gp.suffix.lower() == ".pdf":
+            # PDF ฝังเป็นข้อความในหน้าไม่ได้ — แนบไฟล์ไปใน zip แล้วให้ handout
+            # ลิงก์/แสดงผลจากไฟล์ข้าง ๆ แทน ผู้เรียนเปิดออฟไลน์ได้เหมือนกัน
+            guide_pdf = gp
+            guide_html = render_pdf_guide_section(GUIDE_PDF_NAME, gp.stat().st_size)
+        else:
             guide_md = gp.read_text(encoding="utf-8")
             if cfg.get("_product_params"):
                 guide_md = render_template(guide_md, cfg["_product_params"])
             guide_html = md_to_html(guide_md)
-        else:
-            info(f"คำเตือน: ไม่พบ lab guide {gp} — handout จะไม่มีเนื้อหา guide")
 
     passwords = {}
     for user, vm in lab_info.items():
@@ -773,6 +824,8 @@ def export_lab(cfg):
             dst = udir / f"{user}.pem"
             shutil.copy(key_path, dst)
             dst.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        if guide_pdf:
+            shutil.copy(guide_pdf, udir / GUIDE_PDF_NAME)
         write_connect_files(udir, cfg, user, vm, win_pw)
 
         # zip สำหรับส่งให้ผู้เรียน
@@ -912,6 +965,10 @@ EXPIRABLE_STATUSES = ("active", "error")
 # destroy ที่เพิ่งล้มไป อย่าเพิ่งยิงซ้ำทันที — ถ้าล้มเพราะคีย์หมดอายุ ยิงทุกนาที
 # ก็ล้มทุกนาที ได้แค่ log บวมกับ job ขยะเต็มหน้าจอ
 DESTROY_RETRY_COOLDOWN = 15 * 60
+
+# เตือนก่อน lab ถูกลบอัตโนมัติกี่นาที — ต้องยาวพอให้ผู้สอนกดต่อเวลาทัน
+# แต่ไม่ยาวจนเตือนตั้งแต่คลาสยังไม่เริ่ม
+EXPIRY_WARN_MINUTES = 15
 
 
 def notify(title, message):
@@ -1372,6 +1429,262 @@ def cmd_usage():
          "ไม่ใช่ยอดจริงจาก AWS")
 
 
+# terraform address ของแต่ละชนิด resource ที่ scanner หาเจอ
+# key pair กับ instance ผูกกับ user จึงต้องใส่ index ตอน import
+_ADOPT_ADDRESSES = {
+    "VPC": lambda r, u: "aws_vpc.lab",
+    "subnet": lambda r, u: "aws_subnet.public",
+    "internet gateway": lambda r, u: "aws_internet_gateway.lab",
+    "route table": lambda r, u: "aws_route_table.public",
+    "security group": lambda r, u: "aws_security_group.lab",
+    "EC2 instance": lambda r, u: f'aws_instance.lab["{u}"]',
+    "key pair": lambda r, u: f'aws_key_pair.user["{u}"]',
+}
+
+
+def cmd_share(cfg, port=8899, hours=4):
+    """เปิดให้ผู้เรียนโหลด handout เองผ่าน Wi-Fi ห้องอบรม — ลิงก์เฉพาะคน
+
+    แทนที่จะส่ง zip ทีละคนทางแชท/อีเมล ให้ฉายลิงก์บนจอแล้วให้แต่ละคนกดของตัวเอง
+    """
+    from backend import handoutserver as hs
+    lab = cfg["lab_name"]
+    users = cfg.get("users", [])
+    missing = [u for u in users if not (HANDOUTS_DIR / lab / f"{lab}-{u}.zip").exists()]
+    if missing:
+        die(f"ยังไม่มี handout ของ: {', '.join(missing)} — รัน refresh ก่อน")
+
+    share = hs.HandoutShare(lab, users, port=port, ttl_hours=hours).start()
+    ip = hs.local_ip()
+    links = share.links(ip)
+    print(f"\nเปิดให้โหลด handout ของ '{lab}' — ลิงก์หมดอายุใน {hours} ชม.")
+    print(f"เครื่องผู้เรียนต้องอยู่วง Wi-Fi เดียวกับเครื่องนี้ ({ip})\n")
+    for u in users:
+        print(f"  {u:<16} {links[u]}")
+    print(f"\nใครโหลดแล้วบ้างจะขึ้นด้านล่างนี้ · กด Ctrl+C เพื่อปิด")
+    seen = set()
+    try:
+        while not share.expired():
+            time.sleep(2)
+            for u, t in sorted(share.downloaded.items(), key=lambda kv: kv[1]):
+                if u not in seen:
+                    seen.add(u)
+                    print(f"  ✔ {u} โหลดแล้ว {time.strftime('%H:%M:%S', time.localtime(t))} "
+                          f"({len(seen)}/{len(users)})")
+        info("หมดเวลาแล้ว — ปิดการแชร์")
+    except KeyboardInterrupt:
+        info(f"ปิดการแชร์ · โหลดไปแล้ว {len(seen)}/{len(users)} คน"
+             + (f" · ยังไม่ได้โหลด: {', '.join(u for u in users if u not in seen)}"
+                if len(seen) < len(users) else ""))
+
+
+def cmd_bake_delete(ami_id, region=None):
+    """ลบ AMI ที่อบไว้ พร้อม snapshot — AMI ที่ลืมทิ้งไว้เสียค่าเก็บทุกเดือน"""
+    from backend import aws
+    try:
+        res = aws.delete_image(ami_id, region=region)
+    except aws.AwsError as e:
+        die(str(e))
+    info(f"ลบ AMI {res['ami']} แล้ว")
+    for s in res["snapshots_deleted"]:
+        info(f"  ลบ snapshot {s}")
+    if not res["snapshots_deleted"]:
+        info("  (ไม่มี snapshot ที่ลบได้ — อาจถูก AMI อื่นใช้อยู่)")
+
+
+def cmd_bake(cfg, wait_minutes=20):
+    """อบ AMI จาก lab ที่ติดตั้งของครบแล้ว — รอบหน้าเครื่องพร้อมใช้ใน 40 วินาที
+
+    ทำไมคุ้ม: bootstrap ของ product ต้องโหลด agent installer จากอินเทอร์เน็ตทุกครั้ง
+    ใช้เวลาหลายนาทีและพังได้ถ้าลิงก์ล่ม — อบครั้งเดียวแล้วชี้ custom_ami ไปที่ภาพนั้น
+    """
+    from backend import aws
+    lab = cfg["lab_name"]
+    select_workspace(lab)
+    outputs = tf_outputs()
+    if not outputs or not outputs.get("lab_info"):
+        die(f"ไม่พบเครื่องของ '{lab}' — ต้องมี lab ที่รันอยู่ก่อนถึงจะอบ AMI ได้")
+    first_user = sorted(outputs["lab_info"])[0]
+    vm = outputs["lab_info"][first_user]
+    name = f"{lab}-{time.strftime('%Y%m%d-%H%M')}"
+    info(f"อบ AMI จากเครื่องของ {first_user} ({vm['instance_id']}) → {name}")
+    info("  AWS จะ reboot เครื่องนั้นระหว่างอบเพื่อให้ภาพ consistent")
+    try:
+        ami_id = aws.create_image(vm["instance_id"], name,
+                                  description=f"hands-on lab {lab} ({cfg.get('os', '?')})",
+                                  region=cfg.get("region"))
+    except aws.AwsError as e:
+        die(str(e))
+    info(f"  สั่งอบแล้ว: {ami_id}")
+    info(f"  รอ AWS ประมวลผล (ไม่เกิน {wait_minutes} นาที) …")
+    try:
+        state = aws.wait_image_available(ami_id, region=cfg.get("region"),
+                                         timeout_minutes=wait_minutes)
+    except aws.AwsError as e:
+        die(str(e))
+    if state != "available":
+        info(f"  ยังไม่พร้อม (สถานะ {state}) — เช็คเองใน console ได้ที่ {ami_id}")
+        return
+    info(f"  AMI พร้อมใช้แล้ว ✔  {ami_id}")
+    info("")
+    info("ใช้กับ lab รอบหน้าโดยใส่ในไฟล์ config:")
+    info(f'    "custom_ami": "{ami_id}",')
+    info(f'    "custom_username": "{vm["username"]}",')
+    info(f'    "custom_is_windows": {str(vm["is_windows"]).lower()}')
+
+
+def cmd_report(lab_name, out_path=None):
+    """สรุปผลหลังคลาสเป็นตาราง/CSV — ใครได้เครื่องไหน ใช้ไปกี่ชั่วโมง ค่าใช้จ่ายเท่าไร
+
+    เอาไว้แนบรายงานการอบรมหรือส่งให้บัญชี ข้อมูลมาจาก labs.db ล้วน ไม่ต้องยิง AWS
+    """
+    import csv
+    import io
+    import time
+    from backend import db
+    row = db.get_lab(lab_name)
+    if not row:
+        die(f"ไม่พบ '{lab_name}' ใน labs.db — รายงานได้เฉพาะ lab ที่ระบบบันทึกไว้")
+    usage = {u["lab_name"]: u
+             for u in lab_usage(db.list_labs(), db.list_jobs())}.get(lab_name)
+    cfg = json.loads(row["config_json"]) if row.get("config_json") else {}
+    users = cfg.get("users", [])
+    itype = cfg.get("instance_type", "?")
+    hours = usage["hours"] if usage else 0
+    rate = HOURLY_USD.get(itype, DEFAULT_HOURLY)
+
+    rows = [{"lab": lab_name, "user": u, "os": cfg.get("os", "?"), "instance_type": itype,
+             "ชั่วโมง": f"{hours:.2f}", "ค่าใช้จ่าย_usd": f"{hours * rate:.3f}"} for u in users]
+    total = hours * rate * len(users)
+
+    print(f"\nรายงานการใช้งาน: {lab_name}")
+    print(f"  ชื่อคลาส   : {cfg.get('title', '-')}")
+    print(f"  สร้างเมื่อ  : {time.strftime('%d/%m/%Y %H:%M', time.localtime(row['created_at']))}")
+    print(f"  สถานะ      : {row['status']}")
+    print(f"  เครื่อง     : {len(users)} × {itype} ({cfg.get('os', '?')})")
+    print(f"  ระยะเวลา   : {hours:.2f} ชม./เครื่อง")
+    print(f"  ค่าใช้จ่าย  : ~${total:.2f} (ประมาณจากราคา on-demand)")
+    print(f"\n  {'ผู้เรียน':<20}{'ชั่วโมง':>10}{'~USD':>10}")
+    print("  " + "-" * 40)
+    for r in rows:
+        print(f"  {r['user']:<20}{r['ชั่วโมง']:>10}{r['ค่าใช้จ่าย_usd']:>10}")
+    print()
+
+    if out_path:
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else ["lab"])
+        w.writeheader()
+        w.writerows(rows)
+        Path(out_path).write_text(buf.getvalue(), encoding="utf-8-sig")  # BOM ให้ Excel ไทยอ่านได้
+        info(f"เขียน CSV แล้ว: {out_path}")
+
+
+def cmd_adopt(cfg, dry_run=False):
+    """ดึง resource ที่มีอยู่จริงบน AWS กลับเข้า terraform state
+
+    ใช้ตอน state หาย (เครื่องผู้สอนพัง / ไฟล์ถูกลบ) แต่ของยังรันอยู่บน AWS —
+    scanner หาเจอจาก tag อยู่แล้ว ตัวนี้แค่ต่อยอดเป็น terraform import ให้
+    เพื่อจะได้ destroy ผ่านระบบตามปกติ แทนที่จะไปไล่ลบมือใน console
+    """
+    from backend import aws
+    lab = cfg["lab_name"]
+    try:
+        res = aws.scan_tagged_resources(lab_name=lab,
+                                        regions=[cfg.get("region")] if cfg.get("region") else None)
+    except aws.AwsError as e:
+        die(str(e))
+    if not res["resources"]:
+        info(f"ไม่พบ resource ของ '{lab}' บน AWS — ไม่มีอะไรให้ดึงกลับ")
+        return
+    info(f"พบ {res['total']} resource ของ '{lab}'")
+
+    varfile = build_tfvars(cfg)
+    select_workspace(lab)
+    # state ว่างคือเคสปกติของ adopt (นั่นแหละเหตุผลที่ต้องใช้คำสั่งนี้) จึงเรียกตรง
+    # ไม่ผ่าน tf() ที่ die() ใส่หน้าผู้ใช้เวลาไม่มี state
+    existing = set()
+    exe = terraform_bin()
+    if exe:
+        listed = subprocess.run([exe, f"-chdir={TF_DIR}", "state", "list"],
+                                capture_output=True, text=True, env=os.environ)
+        if listed.returncode == 0:
+            existing = {ln.strip() for ln in listed.stdout.splitlines() if ln.strip()}
+
+    planned, skipped = [], []
+    for r in res["resources"]:
+        maker = _ADOPT_ADDRESSES.get(r["kind"])
+        if not maker:
+            skipped.append((r["kind"], r["id"], "ไม่รู้จักชนิดนี้"))
+            continue
+        # key pair / instance ต้องรู้ว่าเป็นของ user ไหน — อ่านจาก tag
+        user = (r.get("name") or "").replace(f"{lab}-", "") if r["kind"] == "key pair" else None
+        if r["kind"] == "EC2 instance":
+            user = (r.get("name") or "").replace(f"{lab}-", "") or None
+        if r["kind"] in ("EC2 instance", "key pair"):
+            if r["kind"] == "key pair":
+                user = (r["id"] or "").replace(f"{lab}-", "")
+            if not user or user not in cfg.get("users", []):
+                skipped.append((r["kind"], r["id"], "ระบุ user ไม่ได้"))
+                continue
+        addr = maker(r, user)
+        if addr in existing:
+            skipped.append((r["kind"], r["id"], "อยู่ใน state แล้ว"))
+            continue
+        planned.append((addr, r["id"], r["kind"]))
+
+    for addr, rid, kind in planned:
+        if dry_run:
+            info(f"  [dry-run] import {addr} ← {rid} ({kind})")
+            continue
+        info(f"  import {addr} ← {rid}")
+        try:
+            tf(["import", "-input=false", f"-var-file={varfile.name}", addr, rid], capture=True)
+        except SystemExit:
+            info(f"    ‼ import ไม่สำเร็จ — ข้ามตัวนี้")
+    for kind, rid, why in skipped:
+        info(f"  ข้าม {kind} {rid} — {why}")
+    if not dry_run:
+        info("เสร็จแล้ว — ตรวจด้วย: python3 labctl.py status <config> "
+             "แล้วค่อย destroy ตามปกติได้")
+
+
+def cmd_extend(cfg, hours):
+    """ต่อเวลา lab ที่กำลังจะหมดอายุ"""
+    import time
+    from backend import db
+    lab = cfg["lab_name"]
+    row = db.get_lab(lab)
+    if not row:
+        die(f"lab '{lab}' ไม่มีใน labs.db — ต่อเวลาได้เฉพาะ lab ที่สร้างด้วย --ttl หรือจากหน้าเว็บ")
+    if row["status"] != "active":
+        die(f"lab '{lab}' สถานะ {row['status']} — ต่อเวลาได้เฉพาะ lab ที่ active")
+    now = time.time()
+    base = max(row["expires_at"] or now, now)
+    new_exp = base + hours * 3600
+    total = (new_exp - now) / 3600
+    new_date = expire_date_from_ttl(total)
+    db.update_lab_expiry(lab, new_exp, ttl_hours=total, expire_date=new_date)
+    stored = json.loads(row["config_json"]) if row.get("config_json") else dict(cfg)
+    stored["expire_date"] = new_date
+    db.update_lab_config(lab, stored)
+    info(f"ต่อเวลา '{lab}' อีก {hours} ชม. → ลบอัตโนมัติ "
+         f"{time.strftime('%d/%m %H:%M', time.localtime(new_exp))}")
+    info("(tag Expire บน resource จะอัปเดตเมื่อ apply ครั้งถัดไป)")
+
+
+def cmd_reset(cfg, user):
+    """สร้างเครื่องของผู้เรียนคนเดียวใหม่"""
+    if user not in cfg.get("users", []):
+        die(f"ไม่มีผู้เรียนชื่อ '{user}' ใน lab นี้ — มี: {', '.join(cfg.get('users', []))}")
+    varfile = build_tfvars(cfg)
+    select_workspace(cfg["lab_name"])
+    info(f"สร้างเครื่องของ {user} ใหม่ (เครื่องคนอื่นไม่ถูกแตะ) ...")
+    tf(["apply", "-auto-approve", "-input=false",
+        f'-replace=aws_instance.lab["{user}"]', f"-var-file={varfile.name}"])
+    export_lab(cfg)
+    info("เสร็จสิ้น ✔")
+
+
 def cmd_destroy(cfg):
     select_workspace(cfg["lab_name"])
     confirm = input(f"พิมพ์ชื่อ lab '{cfg['lab_name']}' เพื่อยืนยันการลบทั้งหมด: ")
@@ -1395,7 +1708,8 @@ def cmd_serve():
     url = "http://127.0.0.1:8787"
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     info(f"เปิด web UI ที่ {url}  (Ctrl+C เพื่อหยุด)")
-    uvicorn.run(app, host="127.0.0.1", port=8787, log_level="warning")
+    # access_log เปิดไว้เพื่อให้ไล่ปัญหาได้ว่า request มาถึงไหม/ตอบอะไรกลับ
+    uvicorn.run(app, host="127.0.0.1", port=8787, log_level="info", access_log=True)
 
 
 def cmd_products():
@@ -1490,7 +1804,7 @@ def main():
     parser.add_argument("command",
                         choices=["create", "status", "refresh", "destroy", "products",
                                  "guides", "guide", "scan", "expire", "autoexpire",
-                                 "doctor", "usage", "serve"])
+                                 "doctor", "usage", "extend", "reset", "adopt", "report", "bake", "unbake", "share", "serve"])
     parser.add_argument("config", nargs="?", help="ไฟล์ config ของ lab (JSON)")
     parser.add_argument("guide", nargs="?",
                         help="สำหรับคำสั่ง guide: path ของ guide ที่มีอยู่ หรือไฟล์ .md ในเครื่อง")
@@ -1500,6 +1814,16 @@ def main():
                         help="สำหรับคำสั่ง expire: บอกว่าจะลบอะไรบ้างโดยไม่ลบจริง")
     parser.add_argument("--interval", type=int, default=10, metavar="นาที",
                         help="สำหรับ autoexpire install: ตรวจทุกกี่นาที (default 10)")
+    parser.add_argument("--hours", type=float, default=1.0, metavar="ชม.",
+                        help="สำหรับคำสั่ง extend: ต่อเวลาอีกกี่ชั่วโมง (default 1)")
+    parser.add_argument("--user", metavar="ชื่อ",
+                        help="สำหรับคำสั่ง reset: ชื่อผู้เรียนที่จะสร้างเครื่องใหม่")
+    parser.add_argument("--port", type=int, default=8899, metavar="พอร์ต",
+                        help="สำหรับคำสั่ง share: พอร์ตที่เปิดให้ผู้เรียนโหลด (default 8899)")
+    parser.add_argument("--out", metavar="ไฟล์",
+                        help="สำหรับคำสั่ง report: เขียนผลเป็นไฟล์ CSV")
+    parser.add_argument("--spot", action="store_true",
+                        help="สำหรับ create: ใช้ spot instance (ถูกกว่า 60-70%% · ถูกยึดคืนได้)")
     parser.add_argument("--ttl", type=float, metavar="ชั่วโมง",
                         help="สำหรับคำสั่ง create: ลบ lab อัตโนมัติหลังกี่ชั่วโมง "
                              "(ต้องเปิด server ค้างไว้ · ไม่ใส่ = ไม่ลบอัตโนมัติ)")
@@ -1528,6 +1852,16 @@ def main():
     if args.command == "doctor":
         cmd_doctor()
         return
+    if args.command == "unbake":
+        if not args.config:
+            die("ใช้: python3 labctl.py unbake ami-xxxxxxxx")
+        cmd_bake_delete(args.config)
+        return
+    if args.command == "report":
+        if not args.config:
+            die("คำสั่ง report ต้องระบุชื่อ lab เช่น: python3 labctl.py report docker-101")
+        cmd_report(args.config, args.out)
+        return
     if args.command == "usage":
         cmd_usage()
         return
@@ -1547,7 +1881,26 @@ def main():
         return
     if args.ttl is not None and args.command != "create":
         die("--ttl ใช้ได้กับคำสั่ง create เท่านั้น")
+    if args.command == "share":
+        cmd_share(cfg, port=args.port, hours=args.hours)
+        return
+    if args.command == "bake":
+        cmd_bake(cfg)
+        return
+    if args.command == "adopt":
+        cmd_adopt(cfg, dry_run=args.dry_run)
+        return
+    if args.command == "extend":
+        cmd_extend(cfg, args.hours)
+        return
+    if args.command == "reset":
+        if not args.user:
+            die("คำสั่ง reset ต้องระบุ --user ด้วย เช่น --user user01")
+        cmd_reset(cfg, args.user)
+        return
     if args.command == "create":
+        if args.spot:
+            cfg["use_spot"] = True
         try:
             cmd_create(cfg, validate_ttl(args.ttl))
         except ConfigError as e:

@@ -186,6 +186,19 @@ resource "aws_instance" "lab" {
 
   user_data = var.user_data != "" ? var.user_data : null
 
+  # spot: ไม่กำหนด max_price = ยอมจ่ายไม่เกินราคา on-demand
+  # ใช้ one-time เพราะถ้าโดนยึดคืนแล้วต้องให้ terraform สร้างใหม่ ไม่ใช่ AWS หามาแทนเงียบ ๆ
+  dynamic "instance_market_options" {
+    for_each = var.use_spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
+    }
+  }
+
   root_block_device {
     volume_size = var.root_volume_gb
     volume_type = "gp3"
