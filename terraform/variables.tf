@@ -89,3 +89,17 @@ variable "use_spot" {
   type        = bool
   default     = false
 }
+
+variable "user_os" {
+  description = "OS ของเครื่องรายคน (user => os จาก os_catalog) — คนที่ไม่อยู่ใน map ใช้ var.os / custom_ami"
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([for os in values(var.user_os) : contains([
+      "amazon-linux-2023", "amazon-linux-2", "ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04",
+      "debian-11", "debian-12", "suse-15", "windows-2025", "windows-2022", "windows-2019", "windows-2016",
+    ], os)])
+    error_message = "user_os มี OS ที่ไม่รองรับ"
+  }
+}

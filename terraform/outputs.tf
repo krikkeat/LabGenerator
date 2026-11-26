@@ -5,9 +5,9 @@ output "lab_info" {
       instance_id = aws_instance.lab[u].id
       public_ip   = aws_instance.lab[u].public_ip
       public_dns  = aws_instance.lab[u].public_dns
-      os          = local.os_display
-      username    = local.os.username
-      is_windows  = local.os.is_windows
+      os          = local.user_os_display[u]
+      username    = local.user_os[u].username
+      is_windows  = local.user_os[u].is_windows
     }
   }
 }

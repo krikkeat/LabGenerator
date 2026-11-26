@@ -293,6 +293,17 @@ def _run_job(job_id, kind, cfg):
                 pending = _export_lab(cfg, lab, log)
                 if pending:
                     start_password_watcher(cfg, pending)
+            elif kind == "add_users":
+                # users เป็น for_each — apply ด้วยรายชื่อใหม่จึงสร้างเฉพาะเครื่องที่เพิ่ม
+                _set_phase(job_id, "apply")
+                log.write(f"เพิ่มเครื่อง: {', '.join(cfg.get('_new_users', []))} "
+                          f"(เครื่องเดิมไม่ถูกแตะ)\n")
+                _tfrun(["apply", "-auto-approve", "-input=false",
+                        f"-var-file={varfile.name}"], lab=lab, log=log)
+                _set_phase(job_id, "export")
+                pending = _export_lab(cfg, lab, log)
+                if pending:
+                    start_password_watcher(cfg, pending)
             elif kind == "export":
                 # สร้าง handout ใหม่จาก state เดิม — ไม่เรียก apply/refresh จึงไม่
                 # แตะ resource บน AWS เลย ใช้ตอนเปลี่ยน lab guide หรือแก้ title
@@ -339,7 +350,8 @@ def _run_job(job_id, kind, cfg):
         db.update_job(job_id, state="error", error=msg, finished_at=time.time())
         # refresh/export ไม่ได้แก้อะไรบน AWS — ล้มแล้ว lab ยังใช้งานได้ตามเดิม
         # อย่าไปปั๊ม error ทับสถานะที่ยังดีอยู่
-        if kind not in ("refresh", "export"):
+        # add_users ล้มก็ไม่กระทบเครื่องเดิม — lab ยังใช้ต่อได้
+        if kind not in ("refresh", "export", "add_users"):
             db.set_lab_status(lab, "error")
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"\n[job] ล้มเหลว: {msg}\n")

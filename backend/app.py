@@ -4,6 +4,7 @@
 """
 
 import json
+import re
 import shutil
 import stat
 import time
@@ -679,6 +680,66 @@ def api_reset_user(lab_name: str, user: str):
     cfg["_reset_user"] = user
     job_id = jobs.enqueue("reset", cfg)
     return {"job_id": job_id, "lab_name": lab_name, "user": user}
+
+
+MAX_USERS_PER_LAB = 200
+
+
+class AddUsersBody(BaseModel):
+    count: Optional[int] = None          # สร้างชื่อ userNN ต่อจากเลขสุดท้ายให้เอง
+    users: Optional[List[str]] = None    # หรือระบุชื่อเอง
+    os: Optional[str] = None             # ไม่ระบุ = OS เดียวกับคลาส
+
+
+def _next_user_names(existing, count):
+    """userNN ถัดจากเลขที่มากที่สุดที่มีอยู่ — ไม่ชนชื่อเดิม"""
+    nums = [int(m.group(1)) for u in existing
+            if (m := re.fullmatch(r"user(\d+)", u))]
+    start = max(nums, default=0) + 1
+    return [f"user{n:02d}" for n in range(start, start + count)]
+
+
+@app.post("/api/labs/{lab_name}/users", status_code=202)
+def api_add_users(lab_name: str, body: AddUsersBody):
+    """เพิ่มเครื่องให้ผู้เรียนใหม่ใน lab ที่รันอยู่ — terraform for_each สร้างเฉพาะคนที่เพิ่ม"""
+    row = db.get_lab(lab_name)
+    if not row or not row.get("config_json"):
+        raise HTTPException(404, f"ไม่พบ lab '{lab_name}' ที่สร้างจากหน้าเว็บ")
+    if row["status"] != "active":
+        raise HTTPException(409, f"lab '{lab_name}' สถานะ {row['status']} — เพิ่มเครื่องได้เฉพาะ lab ที่ active")
+    stored = json.loads(row["config_json"])
+    existing = list(stored.get("users", []))
+    if body.users:
+        new = [u.strip().lower() for u in body.users if u and u.strip()]
+    elif body.count:
+        if body.count < 1:
+            raise HTTPException(400, "จำนวนเครื่องต้องมากกว่า 0")
+        new = _next_user_names(existing, body.count)
+    else:
+        raise HTTPException(400, "ระบุ count หรือ users")
+    dupes = sorted(set(new) & set(existing)) or sorted({u for u in new if new.count(u) > 1})
+    if dupes:
+        raise HTTPException(400, f"มีชื่อนี้อยู่แล้ว: {', '.join(dupes)}")
+    if len(existing) + len(new) > MAX_USERS_PER_LAB:
+        raise HTTPException(400, f"lab หนึ่งมีได้ไม่เกิน {MAX_USERS_PER_LAB} เครื่อง")
+    updated = {**stored, "users": existing + new}
+    lab_os = None if stored.get("custom_ami") else stored.get("os", "amazon-linux-2023")
+    if body.os and body.os != lab_os:
+        if body.os not in labctl.SUPPORTED_OS:
+            raise HTTPException(400, f"os '{body.os}' ไม่รองรับ")
+        updated["user_os"] = {**stored.get("user_os", {}), **{u: body.os for u in new}}
+    try:
+        cfg = labctl.apply_product(labctl.validate_config(dict(updated)))
+    except labctl.ConfigError as e:
+        raise HTTPException(400, str(e))
+    try:
+        aws.resolve_verified()
+    except aws.AwsError as e:
+        raise HTTPException(400, str(e))
+    # บันทึกก่อน apply — ถ้า apply ล้มกลางทาง กดเพิ่ม/Refresh รอบหน้าจะได้ไม่ลบเครื่องที่สร้างไปแล้ว
+    db.update_lab_config(lab_name, updated)
+    job_id = jobs.enqueue("add_users", {**cfg, "_new_users": new})
+    return {"job_id": job_id, "lab_name": lab_name, "users": new}
 
 
 # ---------------------------------------------------------------------------

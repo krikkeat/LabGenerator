@@ -108,6 +108,12 @@ def validate_config(cfg):
         osname = cfg.get("os", "amazon-linux-2023")
         if osname not in SUPPORTED_OS:
             raise ConfigError(f"os '{osname}' ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
+    # OS รายเครื่อง (เครื่องที่เพิ่มทีหลังด้วย OS ต่างจากคลาส)
+    for u, osname in (cfg.get("user_os") or {}).items():
+        if u not in cfg["users"]:
+            raise ConfigError(f"user_os อ้างถึง '{u}' ที่ไม่อยู่ใน users")
+        if osname not in SUPPORTED_OS:
+            raise ConfigError(f"os '{osname}' ของ {u} ไม่รองรับ — เลือกจาก: {', '.join(SUPPORTED_OS)}")
     return cfg
 
 
@@ -282,6 +288,7 @@ def build_tfvars(cfg):
         "custom_username": cfg.get("custom_username", ""),
         "custom_is_windows": bool(cfg.get("custom_is_windows", False)),
         "use_spot": bool(cfg.get("use_spot", False)),
+        "user_os": cfg.get("user_os") or {},
     }
     bootstrap = cfg.get("bootstrap_script", "")
     if bootstrap:

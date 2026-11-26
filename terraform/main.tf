@@ -76,14 +76,27 @@ locals {
 
   os_display = local.use_custom ? "custom (${var.custom_ami})" : var.os
 
-  # พอร์ตพื้นฐานตาม OS + พอร์ตเพิ่มเติมจาก config
-  base_ports = local.os.is_windows ? [3389] : [22]
+  # OS รายเครื่อง — override เฉพาะคนที่อยู่ใน var.user_os (เช่นเครื่องที่เพิ่มทีหลัง)
+  user_os_name    = { for u in var.users : u => lookup(var.user_os, u, "") }
+  user_os         = { for u, o in local.user_os_name : u => o != "" ? local.os_catalog[o] : local.os }
+  user_os_display = { for u, o in local.user_os_name : u => o != "" ? o : local.os_display }
+  # user_data ของ lab เขียนมาสำหรับ OS หลัก — ส่งให้เครื่อง OS อื่นจะรันพังหรือผิดภาษา
+  user_gets_user_data = { for u, o in local.user_os_name : u => o == "" || (!local.use_custom && o == var.os) }
+
+  # พอร์ตพื้นฐานตาม OS ของทุกเครื่องในคลาส + พอร์ตเพิ่มเติมจาก config
+  base_ports = distinct([for u, os in local.user_os : os.is_windows ? 3389 : 22])
   open_ports = distinct(concat(local.base_ports, var.extra_open_ports))
 }
 
 data "aws_ssm_parameter" "ami" {
   count = local.use_custom ? 0 : 1
   name  = local.os.ssm_parameter
+}
+
+# AMI ของ OS ที่ override รายเครื่อง — หนึ่ง lookup ต่อหนึ่ง OS ไม่ใช่ต่อเครื่อง
+data "aws_ssm_parameter" "user_ami" {
+  for_each = toset([for o in values(local.user_os_name) : o if o != ""])
+  name     = local.os_catalog[each.key].ssm_parameter
 }
 
 data "aws_availability_zones" "available" {
@@ -177,14 +190,15 @@ resource "aws_key_pair" "user" {
 resource "aws_instance" "lab" {
   for_each = toset(var.users)
 
-  ami                    = local.use_custom ? var.custom_ami : data.aws_ssm_parameter.ami[0].value
+  ami = (local.user_os_name[each.key] != "" ? data.aws_ssm_parameter.user_ami[local.user_os_name[each.key]].value
+  : local.use_custom ? var.custom_ami : data.aws_ssm_parameter.ami[0].value)
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.lab.id]
   key_name               = aws_key_pair.user[each.key].key_name
-  get_password_data      = local.os.is_windows
+  get_password_data      = local.user_os[each.key].is_windows
 
-  user_data = var.user_data != "" ? var.user_data : null
+  user_data = var.user_data != "" && local.user_gets_user_data[each.key] ? var.user_data : null
 
   # spot: ไม่กำหนด max_price = ยอมจ่ายไม่เกินราคา on-demand
   # ใช้ one-time เพราะถ้าโดนยึดคืนแล้วต้องให้ terraform สร้างใหม่ ไม่ใช่ AWS หามาแทนเงียบ ๆ

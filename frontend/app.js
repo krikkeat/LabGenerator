@@ -726,6 +726,7 @@ const PHASES = {
   refresh: [['refresh', 'ดึงสถานะล่าสุดจาก AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   reset: [['reset', 'สร้างเครื่องของผู้เรียนใหม่'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   export: [['export', 'สร้าง handout + zip ใหม่'], ['done', 'เสร็จสิ้น']],
+  add_users: [['apply', 'สร้างเครื่องที่เพิ่มบน AWS'], ['export', 'สร้าง handout ใหม่'], ['done', 'เสร็จสิ้น']],
   destroy: [['destroy', 'ลบ resource ทั้งหมดบน AWS'], ['cleanup', 'ลบ key/handout ในเครื่อง'], ['done', 'เสร็จสิ้น']],
 };
 
@@ -960,6 +961,111 @@ function GuideCard({ labName, disabled, onDone }) {
     </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// เพิ่มเครื่องใน lab ที่รันอยู่
+// ---------------------------------------------------------------------------
+
+const MAX_ADD = 50;
+const USER_RE = /^[a-z0-9-]{1,30}$/;
+
+// ต้องตรงกับ _next_user_names ฝั่ง backend — ชื่อที่ preview คือชื่อที่จะได้จริง
+function nextUserNames(existing, count) {
+  const nums = existing.map(u => /^user(\d+)$/.exec(u)).filter(Boolean).map(m => +m[1]);
+  const start = Math.max(0, ...nums) + 1;
+  return Array.from({ length: count }, (_, i) => `user${String(start + i).padStart(2, '0')}`);
+}
+
+function AddUsersModal({ labName, existing, labOs, onClose }) {
+  const [mode, setMode] = useState('count');
+  // custom AMI ไม่อยู่ใน OS_LABELS — ใช้ค่าว่างแทน "เหมือนเครื่องเดิม"
+  const [os, setOs] = useState(OS_LABELS[labOs] ? labOs : '');
+  const [count, setCount] = useState(1);
+  const [namesText, setNamesText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && !busy) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
+  const typed = namesText.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+  const names = mode === 'count' ? nextUserNames(existing, count) : typed;
+  const bad = mode === 'names' ? typed.filter(u => !USER_RE.test(u)) : [];
+  const taken = names.filter((u, i) => existing.includes(u) || names.indexOf(u) !== i);
+  const problem = [
+    bad.length && `ชื่อใช้ได้แค่ a-z, 0-9, - : ${bad.join(', ')}`,
+    taken.length && `มีชื่อนี้อยู่แล้ว: ${[...new Set(taken)].join(', ')}`,
+  ].filter(Boolean).join(' · ') || null;
+  const canSubmit = names.length > 0 && !problem && !busy;
+  const setN = (n) => setCount(Math.min(MAX_ADD, Math.max(1, n || 1)));
+
+  async function submit() {
+    if (!canSubmit) return;
+    setBusy(true); setErr(null);
+    const body = { ...(mode === 'count' ? { count } : { users: names }), ...(os ? { os } : {}) };
+    try {
+      const r = await api(`/labs/${labName}/users`, { method: 'POST', body: JSON.stringify(body) });
+      nav(`/job/${r.job_id}?lab=${labName}`);
+    } catch (e) { setErr(e.message); setBusy(false); }
+  }
+
+  return html`
+    <div class="modal-overlay" onClick=${(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+      <div class="modal add-modal" role="dialog" aria-modal="true" aria-labelledby="add-title">
+        <div id="add-title" class="modal-title">เพิ่มเครื่องให้ผู้เรียน</div>
+        <div class="modal-sub">ตอนนี้มี ${existing.length} เครื่อง · เครื่องเดิมไม่ถูกแตะ</div>
+
+        <div class="seg" role="tablist">
+          <button role="tab" aria-selected=${mode === 'count'} class=${mode === 'count' ? 'on' : ''}
+            onClick=${() => setMode('count')}>ตามจำนวน</button>
+          <button role="tab" aria-selected=${mode === 'names'} class=${mode === 'names' ? 'on' : ''}
+            onClick=${() => setMode('names')}>ตั้งชื่อเอง</button>
+        </div>
+
+        ${mode === 'count' ? html`
+          <div class="flabel">จำนวนเครื่อง</div>
+          <div class="stepper">
+            <button aria-label="ลด" disabled=${count <= 1} onClick=${() => setN(count - 1)}>−</button>
+            <input type="number" min="1" max=${MAX_ADD} value=${count} autofocus
+              onInput=${(e) => setN(parseInt(e.target.value, 10))}
+              onKeyDown=${(e) => { if (e.key === 'Enter') submit(); }} />
+            <button aria-label="เพิ่ม" disabled=${count >= MAX_ADD} onClick=${() => setN(count + 1)}>+</button>
+          </div>` : html`
+          <div class="flabel">ชื่อผู้เรียน <span class="opt">— คั่นด้วย , หรือเว้นวรรค</span></div>
+          <input type="text" value=${namesText} placeholder="alice, bob" autofocus
+            onInput=${(e) => setNamesText(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') submit(); }} />`}
+
+        <div class="flabel" style="margin-top:16px">OS</div>
+        <select value=${os} onChange=${(e) => setOs(e.target.value)}>
+          ${!OS_LABELS[labOs] && html`<option value="">เหมือนเครื่องเดิม (custom AMI)</option>`}
+          ${Object.entries(OS_LABELS).map(([k, v]) => html`
+            <option value=${k}>${v}${k === labOs ? ' — เหมือนเครื่องเดิม' : ''}</option>`)}
+        </select>
+        ${os && OS_LABELS[labOs] && os !== labOs && html`<div class="modal-note" style="margin-top:6px">
+          ต่างจากเครื่องเดิม — สคริปต์ติดตั้งของ lab จะไม่รันบนเครื่องนี้</div>`}
+
+        <div class="add-preview">
+          ${names.length === 0
+            ? html`<span class="muted">พิมพ์ชื่ออย่างน้อย 1 คน</span>`
+            : html`<span class="muted">จะสร้าง</span>
+              ${names.map(u => html`<span key=${u} class="tag ${bad.includes(u) || taken.includes(u) ? 'bad' : ''}">${u}</span>`)}`}
+        </div>
+        ${problem && html`<div class="field-err">${problem}</div>`}
+        <div class="modal-note">ใช้เวลาประมาณ ${(os || labOs || '').startsWith('windows') ? '5–8' : '2–3'} นาที — handout ของเครื่องใหม่จะพร้อมเมื่อเสร็จ</div>
+        <${ErrBox} err=${err} />
+
+        <div class="modal-actions">
+          <button class="btn ghost" disabled=${busy} onClick=${onClose}>ยกเลิก</button>
+          <button class="btn primary" disabled=${!canSubmit} onClick=${submit}>
+            ${busy ? 'กำลังเริ่ม…' : `สร้าง ${names.length || ''} เครื่อง`}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function Dashboard({ labName }) {
   const [lab, setLab] = useState(null);
   const [err, setErr] = useState(null);
@@ -972,6 +1078,7 @@ function Dashboard({ labName }) {
   const [guidePath, setGuidePath] = useState(null);
   const [reach, setReach] = useState({});
   const [reachBusy, setReachBusy] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
 
   const load = useCallback(() => {
     api(`/labs/${labName}`).then(setLab).catch(e => setErr(e.message));
@@ -1004,7 +1111,9 @@ function Dashboard({ labName }) {
   // เปิดคลาสเดิมรอบใหม่ — เติมค่าเดิมให้ wizard แล้วให้ผู้สอนแก้ชื่อ/ผู้เรียนเอง
   function cloneLab() {
     const c = lab.config || {};
-    PREFILL = { ...c, lab_name: '', ttl_hours: lab.ttl_hours ?? 8 };
+    // user_os ผูกกับรายชื่อเดิม — ถ้าติดไปด้วย แก้รายชื่อใน wizard แล้วจะ validate ไม่ผ่าน
+    const { user_os, ...rest } = c;
+    PREFILL = { ...rest, lab_name: '', ttl_hours: lab.ttl_hours ?? 8 };
     nav('/new');
   }
 
@@ -1073,6 +1182,9 @@ function Dashboard({ labName }) {
             ${reachBusy ? 'กำลังตรวจ…' : '⇄ ตรวจการเชื่อมต่อ'}</button>
           <button class="btn ghost small" onClick=${cloneLab}>⧉ สร้างซ้ำ</button>
           ${lab.status === 'active' && html`<button class="btn ghost small" disabled=${busyJob}
+            title="สร้างเครื่องให้ผู้เรียนเพิ่ม เครื่องเดิมไม่กระทบ"
+            onClick=${() => setAddOpen(true)}>＋ เพิ่มเครื่อง</button>`}
+          ${lab.status === 'active' && html`<button class="btn ghost small" disabled=${busyJob}
             onClick=${() => doExtend(1)}>+1 ชม.</button>`}
           <button class="btn ghost small" onClick=${doRefresh} disabled=${busyJob}>↻ Refresh</button>
           <a class="btn ghost small" href="/api/labs/${labName}/handouts/export" download>⤓ Export ทั้งหมด</a>
@@ -1111,7 +1223,7 @@ function Dashboard({ labName }) {
                 <span class="mac-proto">
                   ${reach[m.user] && html`<span style="color:${reach[m.user].reachable ? 'var(--good)' : 'var(--crit)'}">
                     ${reach[m.user].reachable ? `● พร้อม ${reach[m.user].ms}ms` : '● ต่อไม่ได้'} · </span>`}
-                  ${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
+                  ${m.os !== lab.os && OS_LABELS[m.os] ? `${OS_LABELS[m.os]} · ` : ''}${m.is_windows ? 'RDP · 3389' : 'SSH · 22'}</span>
               </div>
               <div class="mac-rows">
                 <div><span class="k">Public IP</span>
@@ -1142,6 +1254,11 @@ function Dashboard({ labName }) {
               </div>
             </div>`)}
         </div>`}
+
+      ${addOpen && html`<${AddUsersModal} labName=${labName}
+        existing=${(lab.config && lab.config.users) || lab.machines.map(m => m.user)}
+        labOs=${(lab.config && lab.config.custom_ami) ? '' : (lab.config && lab.config.os) || lab.os}
+        onClose=${() => setAddOpen(false)} />`}
 
       ${destroyOpen && html`
         <div class="modal-overlay" onClick=${(e) => { if (e.target === e.currentTarget) setDestroyOpen(false); }}>
