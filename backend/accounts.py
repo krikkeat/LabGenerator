@@ -21,6 +21,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import tlstrust
+
 AWS_DIR = Path.home() / ".aws"
 STATE_FILE = Path.home() / ".lab-generator" / "aws-accounts.json"
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -149,7 +151,8 @@ def _export_sso(name):
     try:
         res = subprocess.run([_aws_cli(), "configure", "export-credentials",
                               "--profile", name, "--format", "process"],
-                             capture_output=True, text=True, timeout=EXPORT_TIMEOUT)
+                             capture_output=True, text=True, timeout=EXPORT_TIMEOUT,
+                             env=tlstrust.cli_env())
     except subprocess.TimeoutExpired as e:
         raise AccountError(f"ขอคีย์ของ {name} ไม่ทันเวลา") from e
     if res.returncode != 0:
@@ -234,7 +237,8 @@ def _run_login(exe, name, flag="--profile", target=None):
             _logins[name] = {**_logins[name], **kw}
     try:
         proc = subprocess.Popen([exe, "sso", "login", flag, target or name],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env=tlstrust.cli_env())
         tail = []
         start = time.time()
         for line in proc.stdout:
@@ -441,7 +445,8 @@ def _session_token(name):
 def _sso_call(args, region):
     try:
         res = subprocess.run([_aws_cli(), "sso", *args, "--region", region, "--output", "json"],
-                             capture_output=True, text=True, timeout=EXPORT_TIMEOUT)
+                             capture_output=True, text=True, timeout=EXPORT_TIMEOUT,
+                             env=tlstrust.cli_env())
     except subprocess.TimeoutExpired as e:
         raise AccountError("ถาม AWS SSO ไม่ทันเวลา") from e
     if res.returncode != 0:
@@ -524,7 +529,7 @@ def sso_logout(session):
                                      method="POST", data=b"",
                                      headers={"x-amz-sso_bearer_token": token})
         try:
-            with urllib.request.urlopen(req, timeout=15):
+            with urllib.request.urlopen(req, timeout=15, context=tlstrust.ssl_context()):
                 revoked = True
         except urllib.error.HTTPError as e:
             if e.code not in (401, 403):        # token ตายแล้ว = เป้าหมายสำเร็จอยู่แล้ว

@@ -24,7 +24,7 @@ from xml.etree import ElementTree
 import contextvars
 import contextlib
 
-from . import accounts
+from . import accounts, tlstrust
 
 AWS_DIR = Path.home() / ".aws"
 PROFILE = "labctl"
@@ -100,7 +100,7 @@ def _signed_post(service, region, host, params, access_key, secret_key,
     req = urllib.request.Request(f"https://{host}/", data=body.encode(),
                                  headers=req_headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=tlstrust.ssl_context()) as resp:
             xml = resp.read().decode()
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")
@@ -309,7 +309,7 @@ def terraform_env(base=None, ttl=300, timeout=12):
     if not _env_cache["env"] or now - _env_cache["t"] > ttl or _env_cache.get("key") != key:
         _env_cache = {"t": now, "key": key,
                       "env": credential_env(resolve_verified(timeout=timeout))}
-    env = dict(os.environ if base is None else base)
+    env = tlstrust.cli_env(base)      # proxy ขององค์กรที่ตรวจ HTTPS — ให้ provider เชื่อ CA เดียวกับ macOS
     env.update(_env_cache["env"])
     return env
 

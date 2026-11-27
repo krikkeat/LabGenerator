@@ -124,8 +124,15 @@ function Pill({ status }) {
   return html`<span class="pill ${status}"><span class="dot"></span>${STATUS_LABEL[status] || status}</span>`;
 }
 
+// ข้อความ error จาก backend มีลิงก์ได้ (เช่นหน้า Subscribe ของ Marketplace) — ทำให้กดได้
+function Linkify({ text }) {
+  return String(text).split(/(https:\/\/[^\s)]+)/g).map((part, i) => (i % 2
+    ? html`<a href=${part} target="_blank" rel="noopener" style="color:inherit; text-decoration:underline">${part}</a>`
+    : part));
+}
+
 function ErrBox({ err }) {
-  return err ? html`<div class="err">${err}</div>` : null;
+  return err ? html`<div class="err"><${Linkify} text=${err} /></div>` : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +743,7 @@ function Wizard({ aws, onAws }) {
                     onClick=${() => setForm({ ...form, os: o })}>
                     <span class="n">${OS_LABELS[o] || o}</span>
                     <span class="m">${o.startsWith('windows') ? 'RDP · พร้อมใช้ ~5 นาที'
-                      : o === 'kali-linux' ? 'SSH · ต้อง Subscribe ใน Marketplace' : 'SSH · พร้อมใช้ ~2 นาที'}</span>
+                      : o === 'kali-linux' ? 'SSH · เครื่องมือพร้อมใน ~15 นาที' : 'SSH · พร้อมใช้ ~2 นาที'}</span>
                   </button>`)}
               </div>`}
             ${source === 'product' && html`
@@ -779,7 +786,7 @@ function Wizard({ aws, onAws }) {
               <input type="checkbox" checked=${form.instructorKali}
                 onChange=${(e) => setForm({ ...form, instructorKali: e.target.checked })} />
               <span><b>เพิ่มเครื่อง Instructor (Kali Linux)</b> — ชื่อ <span class="mono">instructor</span> แยกจากเครื่องผู้เรียน
-                <br /><span class="help">ใช้ AMI ทางการของ Kali จาก AWS Marketplace — account นี้ต้องกด Subscribe (ฟรี) ครั้งแรกก่อน ไม่งั้นสร้างไม่ผ่าน</span></span>
+                <br /><span class="help">สร้างจาก Debian 12 แล้วติดตั้ง Kali (kali-linux-headless) ตอนบูต — เข้า SSH ได้ทันที เครื่องมือพร้อมใน ~15 นาที (ไม่ต้อง Subscribe Marketplace)</span></span>
             </label>
           </section>
 
@@ -976,7 +983,7 @@ function JobView({ jobId, labName }) {
             </div>`;
           })}
         </div>
-        ${failed && html`<div class="err">งานล้มเหลว: ${done.error || 'ดูรายละเอียดใน log ด้านล่าง'}</div>`}
+        ${failed && html`<div class="err">งานล้มเหลว: <${Linkify} text=${done.error || 'ดูรายละเอียดใน log ด้านล่าง'} /></div>`}
         <div class="logpane" ref=${logRef}>
           ${lines.length === 0 ? html`<span class="dim">รอ log จาก terraform…</span>`
             : lines.map((l, i) => html`<div key=${i} class=${logClass(l)}>${l}</div>`)}
@@ -1232,7 +1239,7 @@ function AddUsersModal({ labName, existing, labOs, onClose }) {
         </select>
         ${os && OS_LABELS[labOs] && os !== labOs && html`<div class="modal-note" style="margin-top:6px">
           ต่างจากเครื่องเดิม — สคริปต์ติดตั้งของ lab จะไม่รันบนเครื่องนี้${os === 'kali-linux'
-            ? ' · Kali ต้องกด Subscribe (ฟรี) ใน AWS Marketplace ครั้งแรกต่อ account' : ''}</div>`}
+            ? ' · Kali ติดตั้งเครื่องมือตอนบูต ใช้เวลาเพิ่ม ~15 นาที' : ''}</div>`}
 
         <div class="add-preview">
           ${names.length === 0

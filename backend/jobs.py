@@ -14,6 +14,7 @@ import io
 import os
 import subprocess
 import threading
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,15 @@ _CRED_MARKERS = ("ExpiredToken", "InvalidClientTokenId", "SignatureDoesNotMatch"
 
 class JobFailure(Exception):
     pass
+
+
+_OPTIN_RE = re.compile(r"OptInRequired.*?(https://aws\.amazon\.com/marketplace/pp\?sku=[A-Za-z0-9]+)")
+
+
+def _optin_msg(url):
+    return ("\n\nAMI นี้มาจาก AWS Marketplace และ account นี้ยังไม่ได้ Subscribe\n"
+            f"→ เปิด {url} แล้วกด Continue to Subscribe → Accept Terms (ฟรี ทำครั้งเดียวต่อ account)\n"
+            "→ รอสถานะ Active ประมาณ 1-2 นาที แล้วเพิ่มเครื่องนี้ใหม่")
 
 
 def _cred_fail_msg():
@@ -69,6 +79,8 @@ def _tfrun(args, lab=None, log=None, capture=False):
         else:
             raise JobFailure(str(e)) from e
     env.pop("AWS_PROFILE", None)       # คีย์ที่ยัดตรง ๆ ต้องชนะโปรไฟล์อื่น
+    # log ไปแสดงในหน้าเว็บ — escape สีของ terraform กลายเป็นขยะ [31m บนจอ
+    env["TF_CLI_ARGS"] = "-no-color"
     if lab:
         env["TF_WORKSPACE"] = lab
     else:
@@ -82,15 +94,20 @@ def _tfrun(args, lab=None, log=None, capture=False):
         except OSError as e:
             raise JobFailure(f"{labctl.TF_MISSING_MSG}\n(รายละเอียด: {e})") from e
         cred_err = False
+        optin_url = None
         for line in proc.stdout:
             log.write(line)
             log.flush()
             if not cred_err and any(m in line for m in _CRED_MARKERS):
                 cred_err = True
+            if optin_url is None and (m := _OPTIN_RE.search(line)):
+                optin_url = m.group(1)
         proc.wait()
         if proc.returncode != 0:
             msg = f"terraform {' '.join(args)} ล้มเหลว (exit {proc.returncode})"
-            if cred_err:
+            if optin_url:
+                msg += _optin_msg(optin_url)
+            elif cred_err:
                 msg += _cred_fail_msg()
             raise JobFailure(msg)
         return None
@@ -374,6 +391,8 @@ def _run_job_body(job_id, kind, cfg, lab, log_path):
         db.update_job(job_id, state="success", phase="done", finished_at=time.time())
     except BaseException as e:  # รวม SystemExit จาก die() ภายใน labctl
         msg = str(e) or e.__class__.__name__
+        if kind == "add_users":
+            msg += _rollback_new_users(lab, cfg.get("_new_users", []))
         db.update_job(job_id, state="error", error=msg, finished_at=time.time())
         # refresh/export ไม่ได้แก้อะไรบน AWS — ล้มแล้ว lab ยังใช้งานได้ตามเดิม
         # อย่าไปปั๊ม error ทับสถานะที่ยังดีอยู่
@@ -399,6 +418,33 @@ def _remove_user_files(lab, user, log):
             continue
         log.write(f"ลบ {t.relative_to(labctl.BASE_DIR) if t.is_relative_to(labctl.BASE_DIR) else t}\n")
     (labctl.HANDOUTS_DIR / f"{lab}-all.zip").unlink(missing_ok=True)
+
+
+def _rollback_new_users(lab, new_users):
+    """เพิ่มเครื่องไม่สำเร็จ: เอาชื่อที่ไม่ได้เครื่องจริงออกจาก config
+
+    config ถูกบันทึกก่อน apply (กัน apply ครั้งหน้าลบเครื่องที่สร้างไปแล้ว) — แต่ถ้าปล่อยชื่อที่
+    สร้างไม่สำเร็จค้างไว้ จะเพิ่มใหม่ไม่ได้เพราะ "ชื่อซ้ำ" ส่วน key pair/กฎ SG ที่ apply ทิ้งไว้
+    จะถูกเก็บกวาดเองใน apply ครั้งถัดไป"""
+    import json as _json
+    try:
+        outputs = tf_outputs_for(lab) or {}
+    except (JobFailure, ValueError, OSError):
+        return ""          # อ่านไม่ได้ว่าเครื่องไหนเกิดแล้ว — ไม่เดา ปล่อย config ไว้
+    made = set((outputs.get("lab_info") or {}).keys())
+    drop = [u for u in new_users if u not in made]
+    row = db.get_lab(lab)
+    if not drop or not row or not row.get("config_json"):
+        return ""
+    stored = _json.loads(row["config_json"])
+    stored["users"] = [u for u in stored.get("users", []) if u not in drop]
+    user_os = {u: o for u, o in (stored.get("user_os") or {}).items() if u not in drop}
+    if user_os:
+        stored["user_os"] = user_os
+    else:
+        stored.pop("user_os", None)
+    db.update_lab_config(lab, stored)
+    return f"\n\nเอา {', '.join(drop)} ออกจากรายชื่อแล้ว — แก้สาเหตุแล้วกดเพิ่มเครื่องใหม่ได้เลย"
 
 
 def find_config_for(lab_name):

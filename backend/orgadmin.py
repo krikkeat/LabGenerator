@@ -8,6 +8,7 @@
 import json
 import subprocess
 
+from . import tlstrust
 from .accounts import AccountError, _aws_cli
 
 CLI_TIMEOUT = 30
@@ -16,7 +17,8 @@ CLI_TIMEOUT = 30
 def _cli(profile, *args):
     try:
         res = subprocess.run([_aws_cli(), *args, "--profile", profile, "--output", "json"],
-                             capture_output=True, text=True, timeout=CLI_TIMEOUT)
+                             capture_output=True, text=True, timeout=CLI_TIMEOUT,
+                             env=tlstrust.cli_env())
     except subprocess.TimeoutExpired as e:
         raise AccountError(f"AWS ไม่ตอบภายใน {CLI_TIMEOUT} วินาที") from e
     if res.returncode != 0:

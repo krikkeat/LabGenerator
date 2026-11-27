@@ -64,18 +64,17 @@ locals {
       username      = "Administrator"
       is_windows    = true
     }
-    # Kali ไม่มี SSM public parameter — หา AMI ทางการจาก AWS Marketplace ตามชื่อแทน
-    # (804fcc46 คือรหัส product ของ Kali Linux เอง ไม่ใช่ AMI ที่บุคคลที่สามทำมาขาย)
-    # ต้องกด Subscribe ฟรีใน Marketplace ครั้งแรกต่อ account ไม่งั้น RunInstances ถูกปฏิเสธ
+    # Kali: AMI ทางการอยู่ใน AWS Marketplace (ต้อง Subscribe ทุก account ซึ่งหลาย org กดไม่ได้)
+    # จึงเริ่มจาก Debian 12 สาธารณะแล้วแปลงเป็น kali-rolling ตอนบูตด้วย bootstrap/kali.sh
     "kali-linux" = {
-      ami_owner  = "aws-marketplace"
-      ami_name   = "debian-kali-last-snapshot-amd64-*-804fcc46-*"
-      username   = "kali"
-      is_windows = false
+      ssm_parameter = "/aws/service/debian/release/12/latest/amd64"
+      username      = "admin"
+      is_windows    = false
+      bootstrap     = file("${path.module}/bootstrap/kali.sh")
     }
   }
   # ทุก entry ต้องมี key ครบชุดเดียวกัน — ternary ข้างล่างเลือกระหว่าง entry กับ custom object
-  os_catalog = { for k, v in local.os_catalog_raw : k => merge({ ssm_parameter = "", ami_owner = "", ami_name = "" }, v) }
+  os_catalog = { for k, v in local.os_catalog_raw : k => merge({ ssm_parameter = "", ami_owner = "", ami_name = "", bootstrap = "" }, v) }
 
   # custom_ami (BYOL — เช่น Windows 10/11 ที่ import เอง) ชนะ os_catalog
   use_custom = var.custom_ami != ""
@@ -83,6 +82,7 @@ locals {
     ssm_parameter = ""
     ami_owner     = ""
     ami_name      = ""
+    bootstrap     = ""
     username      = var.custom_username
     is_windows    = var.custom_is_windows
   } : local.os_catalog[var.os]
@@ -229,7 +229,9 @@ resource "aws_instance" "lab" {
   key_name               = aws_key_pair.user[each.key].key_name
   get_password_data      = local.user_os[each.key].is_windows
 
-  user_data = var.user_data != "" && local.user_gets_user_data[each.key] ? var.user_data : null
+  # OS ที่ต้องแปลงตอนบูต (เช่น Kali) ใช้สคริปต์ของตัวเอง — ไม่งั้นใช้สคริปต์ของ lab ถ้าเข้ากับ OS
+  user_data = (local.user_os[each.key].bootstrap != "" ? local.user_os[each.key].bootstrap
+  : var.user_data != "" && local.user_gets_user_data[each.key] ? var.user_data : null)
 
   # spot: ไม่กำหนด max_price = ยอมจ่ายไม่เกินราคา on-demand
   # ใช้ one-time เพราะถ้าโดนยึดคืนแล้วต้องให้ terraform สร้างใหม่ ไม่ใช่ AWS หามาแทนเงียบ ๆ
